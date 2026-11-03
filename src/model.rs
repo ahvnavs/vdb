@@ -1,17 +1,20 @@
 use serde::{Deserialize, Serialize};
 
-pub const DATABASE_FORMAT_VERSION: u32 = 2;
-pub const ENVELOPE_FORMAT_VERSION: u8 = 1;
+pub const DATABASE_FORMAT_VERSION: u32 = 3;
+pub const ENVELOPE_FORMAT_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptedDocument {
     pub format_version: u8,
+    pub algorithm: String,
+    pub database_id: String,
+    pub key_id: String,
+    pub key_version: u32,
     pub collection: String,
     pub id: String,
     pub version: u64,
     pub nonce_b64: String,
     pub ciphertext_b64: String,
-    pub plaintext_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

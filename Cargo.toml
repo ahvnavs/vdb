@@ -7,6 +7,7 @@ license = "Apache-2.0 OR MIT"
 
 [dependencies]
 anyhow = "1"
+argon2 = "0.5"
 axum = "0.8.9"
 base64 = "0.22"
 blake3 = "1.8.7"
@@ -15,9 +16,11 @@ clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["zeroize"] }
 hex = "0.4"
 getrandom = "0.4"
+hkdf = "0.12"
 redb = "4.4.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 zeroize = "1"

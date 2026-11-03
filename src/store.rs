@@ -143,7 +143,7 @@ impl ReadSnapshot {
 mod tests {
     use super::*;
     use crate::{
-        crypto::{encrypt_json, generate_key},
+        crypto::{DatabaseKey, encrypt_document, generate_key},
         error::StoreError,
     };
     use std::{
@@ -159,6 +159,19 @@ mod tests {
         let store = Store::open(directory.path().join("test.vdb"))?;
         let key = generate_key().map_err(|e| StoreError::Storage(e.to_string()))?;
         Ok((directory, store, key))
+    }
+
+    fn test_document(
+        store: &Store,
+        secret: &[u8; 32],
+        collection: &str,
+        id: &str,
+        version: u64,
+        plaintext: &[u8],
+    ) -> std::result::Result<EncryptedDocument, anyhow::Error> {
+        let database_id = store.metadata().map_err(anyhow::Error::from)?.database_id;
+        let key = DatabaseKey::from_database_secret(&database_id, *secret)?;
+        encrypt_document(&key, &database_id, collection, id, version, plaintext)
     }
 
     #[test]
@@ -177,7 +190,7 @@ mod tests {
     fn put_delete_tombstone_and_reopen() -> Result<()> {
         let (directory, store, key) = database()?;
         let path = directory.path().join("test.vdb");
-        let document = encrypt_json(&key, "users", "alice", 1, b"{}")
+        let document = test_document(&store, &key, "users", "alice", 1, b"{}")
             .map_err(|e| StoreError::Storage(e.to_string()))?;
         store.put_if(&document, VersionPrecondition::MustNotExist)?;
         store.delete("users", "alice", 2, VersionPrecondition::IfVersion(1))?;
@@ -199,11 +212,30 @@ mod tests {
     }
 
     #[test]
+    fn storage_round_trip_does_not_require_the_content_key() -> Result<()> {
+        let directory = tempdir().map_err(|e| StoreError::Storage(e.to_string()))?;
+        let path = directory.path().join("test.vdb");
+        let store = Store::open(&path)?;
+        let database_id = store.metadata()?.database_id;
+        let key = DatabaseKey::generate().map_err(|e| StoreError::Storage(e.to_string()))?;
+        let document = encrypt_document(&key, &database_id, "users", "alice", 1, b"secret")
+            .map_err(|e| StoreError::Storage(e.to_string()))?;
+        drop(key);
+
+        store.put(&document)?;
+        drop(store);
+        let reopened = Store::open(path)?;
+        assert_eq!(reopened.get("users", "alice")?, Some(document));
+        assert!(reopened.verify()?.valid);
+        Ok(())
+    }
+
+    #[test]
     fn transaction_is_all_or_nothing_on_conflict() -> Result<()> {
         let (_directory, store, key) = database()?;
-        let alice = encrypt_json(&key, "users", "alice", 1, b"{}")
+        let alice = test_document(&store, &key, "users", "alice", 1, b"{}")
             .map_err(|e| StoreError::Storage(e.to_string()))?;
-        let bob = encrypt_json(&key, "users", "bob", 1, b"{}")
+        let bob = test_document(&store, &key, "users", "bob", 1, b"{}")
             .map_err(|e| StoreError::Storage(e.to_string()))?;
         store.put(&alice)?;
         let result = store.write_transaction(vec![
@@ -227,9 +259,9 @@ mod tests {
     #[test]
     fn multi_document_transaction_commits_one_atomic_sequence() -> Result<()> {
         let (_directory, store, key) = database()?;
-        let alice = encrypt_json(&key, "users", "alice", 1, b"{}")
+        let alice = test_document(&store, &key, "users", "alice", 1, b"{}")
             .map_err(|e| StoreError::Storage(e.to_string()))?;
-        let bob = encrypt_json(&key, "users", "bob", 1, b"{}")
+        let bob = test_document(&store, &key, "users", "bob", 1, b"{}")
             .map_err(|e| StoreError::Storage(e.to_string()))?;
         let mutations = store.write_transaction(vec![
             WriteOperation::Put {
@@ -255,7 +287,7 @@ mod tests {
     fn deterministic_checkpoint_and_inclusion_proof_cover_tombstones() -> Result<()> {
         let (_directory, store, key) = database()?;
         for id in ["alice", "bob", "carol"] {
-            let document = encrypt_json(&key, "users", id, 1, b"{}")
+            let document = test_document(&store, &key, "users", id, 1, b"{}")
                 .map_err(|e| StoreError::Storage(e.to_string()))?;
             store.put(&document)?;
         }
@@ -285,14 +317,14 @@ mod tests {
         let writer_id = [8_u8; 16];
         let first_identity = crate::identity::WriterIdentity::from_seed(writer_id, 1, [1_u8; 32])?;
         let first = Store::open_with_identity(&path, first_identity)?;
-        let document = encrypt_json(&[7_u8; 32], "users", "alice", 1, b"{}")
+        let document = test_document(&first, &[7_u8; 32], "users", "alice", 1, b"{}")
             .map_err(|e| StoreError::Storage(e.to_string()))?;
         first.put(&document)?;
         drop(first);
 
         let second_identity = crate::identity::WriterIdentity::from_seed(writer_id, 2, [2_u8; 32])?;
         let second = Store::open_with_identity(&path, second_identity)?;
-        let document = encrypt_json(&[7_u8; 32], "users", "alice", 2, b"{\"v\":2}")
+        let document = test_document(&second, &[7_u8; 32], "users", "alice", 2, b"{\"v\":2}")
             .map_err(|e| StoreError::Storage(e.to_string()))?;
         second.put(&document)?;
         assert_eq!(
@@ -316,11 +348,11 @@ mod tests {
     #[test]
     fn held_snapshot_does_not_observe_later_commit() -> Result<()> {
         let (_directory, store, key) = database()?;
-        let first = encrypt_json(&key, "users", "alice", 1, b"{}")
+        let first = test_document(&store, &key, "users", "alice", 1, b"{}")
             .map_err(|e| StoreError::Storage(e.to_string()))?;
         store.put(&first)?;
         let snapshot = store.read_snapshot()?;
-        let second = encrypt_json(&key, "users", "alice", 2, b"{\"v\":2}")
+        let second = test_document(&store, &key, "users", "alice", 2, b"{\"v\":2}")
             .map_err(|e| StoreError::Storage(e.to_string()))?;
         store.put(&second)?;
         assert_eq!(
@@ -340,7 +372,7 @@ mod tests {
     #[test]
     fn concurrent_readers_and_single_cas_winner() -> Result<()> {
         let (_directory, store, key) = database()?;
-        let initial = encrypt_json(&key, "users", "alice", 1, b"{}")
+        let initial = test_document(&store, &key, "users", "alice", 1, b"{}")
             .map_err(|e| StoreError::Storage(e.to_string()))?;
         store.put(&initial)?;
         let store = Arc::new(store);
@@ -350,7 +382,8 @@ mod tests {
             let store = Arc::clone(&store);
             let barrier = Arc::clone(&barrier);
             writers.push(thread::spawn(move || {
-                let document = encrypt_json(&key, "users", "alice", 2, &[marker]).expect("encrypt");
+                let document =
+                    test_document(&store, &key, "users", "alice", 2, &[marker]).expect("encrypt");
                 barrier.wait();
                 store.put_if(&document, VersionPrecondition::IfVersion(1))
             }));
@@ -405,7 +438,7 @@ mod tests {
         if env::var_os(CHILD_FLAG).is_some() {
             let path = env::var_os(PATH_FLAG).expect("child database path");
             let store = Store::open(path)?;
-            let document = encrypt_json(&[9_u8; 32], "users", "alice", 1, b"{}")
+            let document = test_document(&store, &[9_u8; 32], "users", "alice", 1, b"{}")
                 .map_err(|e| StoreError::Storage(e.to_string()))?;
             store.put(&document)?;
             std::process::abort();

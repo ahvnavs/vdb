@@ -8,15 +8,15 @@ Status: implemented state as of 2026-11-04. The local storage foundation is func
 
 `RedbEngine` is the only storage-engine implementation. It translates VDB namespaces, records, transactions, snapshots, and errors to redb. redb supplies serializable single-writer transactions, concurrent MVCC readers, crash recovery, and durable pages; VDB owns all database semantics and record formats.
 
-`crypto.rs` performs client-side XChaCha20-Poly1305 encryption. Envelope format, collection, document ID, logical version, and the visible plaintext digest are authenticated as associated data. Storage and server code do not require document keys.
+`crypto.rs` is the trusted-client boundary. It derives collection and document keys from a versioned database key with HKDF-SHA256, then uses XChaCha20-Poly1305. Associated data binds the envelope version, algorithm, database ID, key ID/version, collection, document ID, and logical version. Storage and server code accept, persist, hash, and reproduce opaque envelopes without document keys.
 
 The CLI and HTTP adapter remain thin callers of `Store`. The HTTP service still lacks production network security and must not be exposed to an untrusted network.
 
-## Durable format version 2
+## Durable format version 3
 
 Every new database receives a checksummed header containing:
 
-- database format version `2`;
+- database format version `3`;
 - a random 128-bit database identity encoded as lowercase hexadecimal;
 - creation time in Unix milliseconds.
 
@@ -26,7 +26,7 @@ The backend uses private tables for database metadata, document metadata, encryp
 
 Persisted VDB records use explicit canonical binary encodings: domain tag, fixed-width big-endian integers, length-prefixed byte strings, and strict trailing-byte rejection. Checksummed records use BLAKE3 over the canonical body. Mutation hashes cover canonical mutation material rather than JSON or delimiter-concatenated strings.
 
-Format 2 is explicit but remains pre-stable. Unsigned format 1 is rejected, and no migration is implemented.
+Format 3 is explicit but remains pre-stable. Formats 1 and 2 are rejected, and no migration is implemented. Format 3 introduces encrypted-envelope format 2 and deliberately removes the plaintext fingerprint that format 2 exposed.
 
 ## Document state
 
@@ -46,7 +46,7 @@ A `ReadSnapshot` owns a redb read transaction and presents a stable point-in-tim
 
 ## Integrity and errors
 
-Open validates the database header and format. Reads validate record domains, lengths, UTF-8, checksums, flags, size limits, metadata invariants, payload presence, and payload hashes. Verification also checks Ed25519 signatures, writer/key-version bindings, database identity, replay indexes, contiguous hash-linked history, and current state. Deterministic Merkle checkpoints and proofs cover live metadata and tombstones.
+Open validates the database header and format. Reads validate record domains, lengths, UTF-8, checksums, flags, size limits, metadata invariants, payload presence, envelope structure, and payload hashes. Verification also checks Ed25519 signatures, writer/key-version bindings, database identity, replay indexes, contiguous hash-linked history, and current state. Deterministic Merkle checkpoints and proofs cover live metadata and tombstones. Without a content key, storage verification cannot authenticate an envelope's AEAD tag or determine whether ciphertext decrypts.
 
 `StoreError` distinguishes caller-correctable invalid input and write conflicts from unsupported formats, detected corruption, and storage failures. A failed history verification returns a structured invalid report; malformed bytes encountered during decoding return a corruption error.
 

@@ -5,7 +5,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use base64::Engine as _;
 use redb::{
     Database, ReadTransaction, ReadableDatabase, ReadableTable, ReadableTableMetadata,
     TableDefinition,
@@ -13,6 +12,7 @@ use redb::{
 
 use crate::{
     codec::{Decoder, Encoder},
+    crypto::validate_envelope,
     error::{Result, StoreError, corruption, storage},
     identity::{SIGNATURE_ALGORITHM, WriterIdentity, verify_signature},
     merkle::{build_proof, build_root, state_leaf},
@@ -168,7 +168,7 @@ impl StorageEngine for RedbEngine {
 
                 let (metadata, payload, kind) = match operation {
                     WriteOperation::Put { document, .. } => {
-                        validate_document(document)?;
+                        validate_document(document, &database_id)?;
                         ensure_newer(collection, id, existing.as_ref(), document.version)?;
                         let bytes = encode_document(document);
                         let payload_hash = blake3::hash(&bytes).to_hex().to_string();
@@ -603,28 +603,13 @@ fn validate_identity(collection: &str, id: &str) -> Result<()> {
     }
     Ok(())
 }
-fn validate_document(document: &EncryptedDocument) -> Result<()> {
+fn validate_document(document: &EncryptedDocument, expected_database_id: &str) -> Result<()> {
     validate_identity(&document.collection, &document.id)?;
-    if document.format_version != 1 || document.version == 0 {
+    validate_envelope(document)
+        .map_err(|_| StoreError::InvalidInput("invalid encrypted envelope".into()))?;
+    if document.database_id != expected_database_id {
         return Err(StoreError::InvalidInput(
-            "unsupported envelope or zero version".into(),
-        ));
-    }
-    let nonce = base64::engine::general_purpose::STANDARD
-        .decode(&document.nonce_b64)
-        .map_err(|_| StoreError::InvalidInput("invalid nonce encoding".into()))?;
-    let ciphertext = base64::engine::general_purpose::STANDARD
-        .decode(&document.ciphertext_b64)
-        .map_err(|_| StoreError::InvalidInput("invalid ciphertext encoding".into()))?;
-    if nonce.len() != 24
-        || ciphertext.len() > MAX_PAYLOAD
-        || hex::decode(&document.plaintext_hash)
-            .map_err(|_| StoreError::InvalidInput("invalid plaintext hash".into()))?
-            .len()
-            != 32
-    {
-        return Err(StoreError::InvalidInput(
-            "invalid encrypted envelope".into(),
+            "encrypted envelope belongs to another database".into(),
         ));
     }
     Ok(())
@@ -678,29 +663,35 @@ fn conflict(collection: &str, id: &str, expected: String, actual: String) -> Sto
 }
 
 fn encode_document(value: &EncryptedDocument) -> Vec<u8> {
-    let mut e = Encoder::new(b"vdb.envelope.storage.v1\0");
+    let mut e = Encoder::new(b"vdb.envelope.storage.v2\0");
     e.u8(value.format_version);
+    e.string(&value.algorithm);
+    e.string(&value.database_id);
+    e.string(&value.key_id);
+    e.u32(value.key_version);
     e.string(&value.collection);
     e.string(&value.id);
     e.u64(value.version);
     e.string(&value.nonce_b64);
     e.string(&value.ciphertext_b64);
-    e.string(&value.plaintext_hash);
     with_checksum(e.finish())
 }
 fn decode_document(bytes: &[u8]) -> Result<EncryptedDocument> {
-    let mut d = Decoder::new(checked_body(bytes)?, b"vdb.envelope.storage.v1\0")?;
+    let mut d = Decoder::new(checked_body(bytes)?, b"vdb.envelope.storage.v2\0")?;
     let value = EncryptedDocument {
         format_version: d.u8()?,
+        algorithm: d.string(32)?,
+        database_id: d.string(32)?,
+        key_id: d.string(32)?,
+        key_version: d.u32()?,
         collection: d.string(MAX_NAME)?,
         id: d.string(MAX_NAME)?,
         version: d.u64()?,
         nonce_b64: d.string(64)?,
         ciphertext_b64: d.string(MAX_PAYLOAD * 2)?,
-        plaintext_hash: d.string(64)?,
     };
     d.finish()?;
-    validate_document(&value).map_err(|e| corruption(e.to_string()))?;
+    validate_envelope(&value).map_err(|e| corruption(e.to_string()))?;
     Ok(value)
 }
 fn encode_document_metadata(value: &DocumentMetadata) -> Vec<u8> {
@@ -976,7 +967,8 @@ fn invalid_report(mutations: u64, head: &str, error: &str) -> VerifyReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::encrypt_json;
+    use crate::crypto::{DatabaseKey, ENCRYPTION_ALGORITHM, encrypt_document};
+    use base64::Engine as _;
     use proptest::prelude::*;
     use tempfile::tempdir;
 
@@ -988,8 +980,8 @@ mod tests {
         }
 
         #[test]
-        fn envelope_canonical_round_trip(collection in "[a-z]{1,20}", id in "[a-z0-9]{1,20}", version in 1_u64..u64::MAX, plaintext in proptest::collection::vec(any::<u8>(), 0..100)) {
-            let value = EncryptedDocument { format_version: 1, collection, id, version, nonce_b64: base64::engine::general_purpose::STANDARD.encode([7_u8; 24]), ciphertext_b64: base64::engine::general_purpose::STANDARD.encode(plaintext), plaintext_hash: "ab".repeat(32) };
+        fn envelope_canonical_round_trip(collection in "[a-z]{1,20}", id in "[a-z0-9]{1,20}", version in 1_u64..u64::MAX, ciphertext in proptest::collection::vec(any::<u8>(), 16..100)) {
+            let value = EncryptedDocument { format_version: 2, algorithm: ENCRYPTION_ALGORITHM.into(), database_id: "11".repeat(16), key_id: "22".repeat(16), key_version: 1, collection, id, version, nonce_b64: base64::engine::general_purpose::STANDARD.encode([7_u8; 24]), ciphertext_b64: base64::engine::general_purpose::STANDARD.encode(ciphertext) };
             prop_assert_eq!(decode_document(&encode_document(&value)).expect("round trip"), value);
         }
 
@@ -1044,7 +1036,10 @@ mod tests {
         let directory = tempdir().expect("temporary directory");
         let engine = RedbEngine::open(directory.path().join("tampered.vdb")).expect("open");
         let identity = WriterIdentity::from_seed([1_u8; 16], 1, [2_u8; 32]).expect("identity");
-        let document = encrypt_json(&[3_u8; 32], "users", "alice", 1, b"{}").expect("encrypt");
+        let database_id = engine.metadata().expect("metadata").database_id;
+        let key = DatabaseKey::from_database_secret(&database_id, [3_u8; 32]).expect("key");
+        let document =
+            encrypt_document(&key, &database_id, "users", "alice", 1, b"{}").expect("encrypt");
         engine
             .write(
                 &[WriteOperation::Put {

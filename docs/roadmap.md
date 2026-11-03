@@ -8,7 +8,7 @@ Restore compilation; authenticate envelope metadata; validate inputs; use unambi
 
 ## Stage 1 — stable embedded kernel (in progress)
 
-Implemented foundation: typed errors, internal storage traits, database identity and format header, separate document metadata, tombstones, optimistic concurrency, atomic multi-document transactions, MVCC read snapshots, canonical records, current-state verification, and initial property/corruption/process-abort/concurrency tests. Remaining: remove or key plaintext fingerprints; offline backup/restore; migrations; savepoints where justified; broader crash/fault injection and compatibility testing; stable API review and benchmark baseline.
+Implemented foundation: typed errors, internal storage traits, database identity and format header, separate document metadata, tombstones, optimistic concurrency, atomic multi-document transactions, MVCC read snapshots, canonical records, current-state verification, client-side authenticated encryption, a versioned key hierarchy, password-protected key export, and initial property/corruption/process-abort/concurrency tests. Remaining: offline backup/restore; migrations; savepoints where justified; broader crash/fault injection and compatibility testing; stable API review and benchmark baseline.
 
 ## Stage 2 — identity and verifiable history (foundation implemented)
 
@@ -32,4 +32,4 @@ Add snapshots/compaction coordination, safe garbage collection, replication obse
 
 ## Immediate next milestone
 
-Complete Stage 1 with offline backup/restore and an atomic migration framework, then run a stable API/format review and build the compatibility matrix before declaring format 1 stable.
+Complete Stage 1 with offline backup/restore and an atomic migration framework, then run a stable API/format review and build the compatibility matrix before declaring any database format stable.

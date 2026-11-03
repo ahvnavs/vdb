@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use vdb::{
     api,
-    crypto::{decrypt_json, encrypt_json, generate_key, key_from_hex},
+    crypto::{DatabaseKey, decrypt_document, encrypt_document, generate_key, key_from_hex},
     identity::WriterIdentity,
     store::Store,
 };
@@ -83,12 +83,21 @@ async fn main() -> Result<()> {
             file,
             version,
         } => {
-            let key = zeroize::Zeroizing::new(key_from_hex(&key)?);
-            let plaintext = fs::read(file)?;
-            serde_json::from_slice::<serde_json::Value>(&plaintext)
+            let raw_key = zeroize::Zeroizing::new(key_from_hex(&key)?);
+            let plaintext = zeroize::Zeroizing::new(fs::read(file)?);
+            serde_json::from_slice::<serde_json::Value>(plaintext.as_ref())
                 .map_err(|e| anyhow!("input must be valid JSON: {e}"))?;
-            let doc = encrypt_json(&key, &collection, &id, version, &plaintext)?;
             let store = Store::open(&db)?;
+            let database_id = store.metadata()?.database_id;
+            let key = DatabaseKey::from_database_secret(&database_id, *raw_key)?;
+            let doc = encrypt_document(
+                &key,
+                &database_id,
+                &collection,
+                &id,
+                version,
+                plaintext.as_ref(),
+            )?;
             let mutation = store.put(&doc)?;
             println!("{}", serde_json::to_string_pretty(&mutation)?);
         }
@@ -98,13 +107,14 @@ async fn main() -> Result<()> {
             collection,
             id,
         } => {
-            let key = zeroize::Zeroizing::new(key_from_hex(&key)?);
             let store = Store::open(&db)?;
+            let database_id = store.metadata()?.database_id;
+            let key = DatabaseKey::from_database_secret(&database_id, key_from_hex(&key)?)?;
             let doc = store
                 .get(&collection, &id)?
                 .ok_or_else(|| anyhow!("not found"))?;
-            let plaintext = decrypt_json(&key, &doc)?;
-            println!("{}", String::from_utf8(plaintext)?);
+            let plaintext = zeroize::Zeroizing::new(decrypt_document(&key, &doc)?);
+            println!("{}", std::str::from_utf8(plaintext.as_ref())?);
         }
         Command::Verify { db } => {
             let store = Store::open(&db)?;

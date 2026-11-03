@@ -8,14 +8,14 @@ VDB is not production-ready. The current server has no TLS, authentication, or a
 
 1. Document bodies are encrypted with XChaCha20-Poly1305 before persistence.
 2. The server/API stores opaque encrypted envelopes; it does not require the document key.
-3. Envelope identity and version are authenticated as AEAD associated data.
+3. Envelope database, identity, version, and exact key reference are authenticated as AEAD associated data.
 4. Every stored envelope is hashed with BLAKE3.
 5. Every mutation has a database-bound BLAKE3 ID, Ed25519 signature, and hash-chain link.
 6. Document versions must increase monotonically.
 7. Local storage is ACID via redb.
 8. The database can run as a local CLI or expose a built-in HTTP API.
 
-This is **not** yet production-ready cryptographic software. v0.1 establishes the architecture and invariants.
+This is **not** yet production-ready cryptographic software. The current release establishes the architecture and invariants.
 
 ## Build
 
@@ -112,9 +112,9 @@ Disk
 
 ## Next milestones
 
-- authenticated client identities and Ed25519-signed mutations
-- Merkle checkpoints and inclusion proofs
-- encrypted secondary indexes using explicit blind indexes
+- offline backup/restore and atomic database migrations
+- stable API and compatibility fixtures
+- query planning with client-side filtering for protected fields
 - peer replication protocol
 - conflict resolution for offline/local-first replicas
 - streaming change feed

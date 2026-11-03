@@ -46,7 +46,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{crypto::encrypt_json, model::MutationKind, store::Store};
+    use crate::{
+        crypto::{DatabaseKey, encrypt_document},
+        model::MutationKind,
+        store::Store,
+    };
 
     fn history_fixture() -> (
         tempfile::TempDir,
@@ -56,9 +60,11 @@ mod tests {
     ) {
         let directory = tempdir().expect("temporary directory");
         let store = Store::open(directory.path().join("history.vdb")).expect("open store");
+        let database_id = store.metadata().expect("metadata").database_id;
+        let key = DatabaseKey::from_database_secret(&database_id, [7_u8; 32]).expect("key");
         for (id, version) in [("alice", 1), ("bob", 1)] {
-            let document =
-                encrypt_json(&[7_u8; 32], "users", id, version, b"{}").expect("encrypt document");
+            let document = encrypt_document(&key, &database_id, "users", id, version, b"{}")
+                .expect("encrypt document");
             store.put(&document).expect("write document");
         }
         let records = vec![

@@ -16,12 +16,12 @@ Items marked **enforced** are implemented and tested. Remaining items constrain 
 12. A document logical version always strictly increases across live and tombstone states. **Enforced.**
 13. Mutation sequences begin at one, are unique, contiguous, and ordered exactly as operations commit. **Enforced and verified.**
 14. Every mutation after genesis names the exact preceding mutation hash. **Enforced and verified.**
-15. Anything entering a VDB cryptographic hash or signature uses raw content bytes or an explicit domain-separated canonical binary encoding, never map iteration, platform-native integers, JSON formatting, or ambiguous delimiters. **Enforced for format 2.**
+15. Anything entering a VDB cryptographic hash or signature uses raw content bytes or an explicit domain-separated canonical binary encoding, never map iteration, platform-native integers, JSON formatting, or ambiguous delimiters. **Enforced for format 3.**
 16. Persisted canonical records reject wrong domains, truncation, overflow, excessive fields, invalid flags, checksum mismatch, and trailing bytes. **Enforced.**
 17. A held read snapshot never observes commits made after the snapshot began. **Enforced by redb MVCC and tested.**
 18. Concurrent readers do not block one another; concurrent exact-version writers have at most one successful commit. **Enforced and tested.**
 19. Caller-correctable invalid input/conflicts are distinguishable from corruption, unsupported format, and storage failure. **Enforced by typed errors.**
-20. Envelope identity, logical version, and visible plaintext digest are authenticated with ciphertext. **Enforced for envelope format 1.**
+20. Envelope format/algorithm, database ID, key ID/version, collection, document ID, and logical version are authenticated with ciphertext. **Enforced for envelope format 2.**
 21. Failed encryption authentication never returns plaintext. **Enforced.**
 22. Storage and network layers never require a document encryption key. **Enforced by the current API boundary.**
 23. No committed mutation may disappear without detectable evidence anchored outside the database. **Not yet enforced; external checkpoints are absent.**
@@ -34,3 +34,8 @@ Items marked **enforced** are implemented and tested. Remaining items constrain 
 30. Deterministic state roots include all current live records and tombstones in canonical order. **Enforced.**
 31. Inclusion proofs bind complete document metadata and identity to a checkpoint root. **Enforced and negatively tested.**
 32. Local verification cannot detect self-consistent rollback without an externally retained checkpoint. **Explicit limitation.**
+33. Encryption nonces are generated internally from the OS CSPRNG and callers cannot supply them. **Enforced; uniqueness is probabilistic over a 192-bit space.**
+34. Each encrypted document key is domain-separated by database key, database ID, collection, document ID, and key version. **Enforced with HKDF-SHA256.**
+35. Decryption selects an exact key ID and version; rotation never silently substitutes the newest key. **Enforced and tested.**
+36. Password-wrapped key imports accept only the implemented Argon2id policy and authenticated wrap format; parameter downgrade is rejected. **Enforced.**
+37. Storage may validate envelope structure without keys but must not claim ciphertext authenticity until a key-holding client verifies the AEAD tag. **Enforced by the API boundary and documented limitation.**

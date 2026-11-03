@@ -1,41 +1,33 @@
 # Cryptography
 
-Status: implemented cryptographic integrity architecture for database format 2.
+Status: implemented client-side confidentiality and verifiable-history architecture for database format 3. VDB composes established primitives; it does not define a cipher, KDF, signature scheme, or hash function.
 
-## Primitives
+## Document encryption
 
-- XChaCha20-Poly1305 from RustCrypto protects document plaintext using OS-generated 192-bit nonces.
-- BLAKE3 provides content hashes, mutation IDs, record hashes/checksums, and Merkle hashes. Uses have distinct domain strings.
-- Ed25519 from `ed25519-dalek` signs canonical mutation bytes.
-- Secret seeds and CLI key buffers use `zeroize`; Ed25519 secret zeroization is enabled.
+Trusted clients encrypt with XChaCha20-Poly1305 from RustCrypto. The API generates a fresh 192-bit nonce with the OS CSPRNG and does not accept caller-provided nonces. This makes accidental reuse unavailable through the supported API; uniqueness remains probabilistic rather than mathematically guaranteed.
 
-VDB defines encodings and domain separation, not custom cryptographic primitives.
+Envelope format 2 contains the algorithm, database ID, key ID and version, collection, document ID, logical version, nonce, and ciphertext/tag. A canonical, domain-separated binary representation of every field except nonce and ciphertext is authenticated as associated data. Moving ciphertext to another database, namespace, identity, version, or key reference therefore fails decryption. There is no persisted plaintext hash.
 
-## Writer identities
+The storage and HTTP layers treat the envelope as opaque. They can validate its schema and sizes, hash it into signed mutations, and store/reproduce it without any content key. They cannot verify the AEAD tag, distinguish valid ciphertext from structurally valid garbage, or decrypt it.
 
-A `WriterIdentity` contains a random 128-bit writer ID, non-zero key version, Ed25519 signing key, and public key. Generation uses the OS CSPRNG. `vdb writer-keygen` emits provisioning material; its terminal output remains sensitive.
+## Key hierarchy and rotation
 
-The database binds `(writer ID, key version)` to one public key. Reusing that tuple with another key is corruption. A writer may advance key versions under the same writer ID. Format 2 does not yet require an old key to authorize a new key, revoke keys, or confer write permission. Identity proves possession and provenance, not authorization.
+`DatabaseKey` holds a random 256-bit root secret, random 128-bit key ID, and non-zero version. HKDF-SHA256 derives a collection key from the root, database ID, collection, and key version, then derives a document key from that collection key and document ID. Derived keys and root secrets use zeroizing containers where practical.
 
-## Canonical mutations
+Rotation preserves the key ID, generates a new independent root secret, and increments the version. Envelopes select an exact `(key ID, version)`; no fallback to a newer key occurs. A `Keyring` may retain old versions for old envelopes while new writes use the newest version. Rotation does not re-encrypt existing records automatically, and deletion of an old key makes its records unavailable.
 
-The signed representation uses domain `vdb.mutation.signing.v2` and canonical fields: database ID; sequence and kind; collection, document ID, version; metadata and optional payload hashes; predecessor record hash; writer ID, key version, public key, and algorithm. Integers are fixed-width big-endian and variable fields are unsigned 64-bit length-prefixed bytes.
+The current CLI accepts a raw high-entropy 32-byte hexadecimal database secret for compatibility and derives a database-scoped key ID. Arguments and `keygen` output may be exposed by shell history, process inspection, or terminal capture, so these commands are transitional provisioning interfaces rather than safe fleet key custody.
 
-The mutation ID is BLAKE3 over those bytes. Ed25519 signs the same bytes. A separate mutation-record hash commits to the signed bytes, mutation ID, and signature; the successor references that hash. A unique mutation-ID index rejects replay. Verification rejects malformed encoding, wrong database identity, gaps, reordering, predecessor changes, duplicate IDs, unregistered keys, invalid signatures, and record-hash mismatch.
+## Password-protected key export
 
-## State checkpoints and proofs
+`DatabaseKey::wrap_with_password` exports an authenticated, versioned JSON-compatible structure. Argon2id derives the wrapping key with a random 128-bit salt, 19 MiB memory, three iterations, and one lane; XChaCha20-Poly1305 wraps the key ID, version, and root secret with a random nonce. Import requires the exact supported policy and rejects downgrade, malformed input, wrong passwords, and modified ciphertext. Applications should choose strong passwords and protect the wrapped file like a credential. No plaintext key temporary file is created by VDB.
 
-A checkpoint contains format version, database ID, latest sequence, history head, state root, and leaf count. Leaves cover live records and tombstones, sorted by canonical namespace key. A leaf commits to document identity, version, creation/modification sequence, deletion flag, and optional payload hash. Ordered Merkle nodes use a separate domain; an odd final child is duplicated; the empty root has its own domain.
+## Verifiable history
 
-Inclusion proofs contain complete document metadata, position, leaf hash, sibling path, and checkpoint. Verification recomputes the identity-bound leaf and root. Checkpoints are not separately signed; detecting a self-consistent rollback requires a checkpoint retained outside the database.
+BLAKE3 supplies domain-separated payload hashes, mutation IDs, record checksums, and Merkle hashes. Ed25519 signs canonical mutations. Signing material includes the database ID, sequence, operation, namespace, logical version, state hashes, predecessor, writer ID, writer-key version, public key, and algorithm. A unique mutation-ID index rejects replay, and successors reference the complete signed-record hash.
 
-## Verification
-
-- `vdb verify` checks the stored signature chain, writer registry, replay index, current metadata, ciphertext hashes, and tombstones.
-- `Store::mutation` and `history::verify_mutation` verify individual mutations.
-- `history::verify_history` verifies exported ordered histories and detects truncation when given a retained checkpoint.
-- `Store::checkpoint`, `Store::inclusion_proof`, and `merkle::verify_inclusion_proof` provide state commitments and membership verification.
+State checkpoints commit to live records and tombstones in canonical namespace order. Inclusion proofs bind complete document metadata and identity to the root. `vdb verify` validates stored structure, signatures, history linkage, current-state hashes, and Merkle state, but does not possess document keys and therefore does not authenticate AEAD tags.
 
 ## Limits
 
-This is not blockchain consensus: there is no mining, token, proof-of-work, quorum, or global ordering. Signatures do not implement authorization or revocation. A complete older database verifies locally unless compared with an external checkpoint.
+This is not blockchain consensus. Signatures prove key possession and provenance, not authorization. A self-consistent old database requires an externally retained checkpoint to detect rollback. There is no searchable encryption, blind index, deterministic encryption, order leakage mechanism, key revocation protocol, hardware-backed custody, or automatic re-encryption during rotation.

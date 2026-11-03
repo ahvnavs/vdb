@@ -1,6 +1,6 @@
 # ADR 0002: XChaCha20-Poly1305 client envelope
 
-Status: accepted, format 1
+Status: superseded by ADR 0007 and encrypted-envelope format 2
 
 ## Decision
 
