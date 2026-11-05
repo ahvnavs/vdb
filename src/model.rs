@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const DATABASE_FORMAT_VERSION: u32 = 3;
+pub const DATABASE_FORMAT_VERSION: u32 = 5;
 pub const ENVELOPE_FORMAT_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

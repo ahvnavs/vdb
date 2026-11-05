@@ -1,6 +1,6 @@
 # Cryptography
 
-Status: implemented client-side confidentiality and verifiable-history architecture for database format 3. VDB composes established primitives; it does not define a cipher, KDF, signature scheme, or hash function.
+Status: implemented client-side confidentiality, verifiable history, and signed causal replication for database format 5. VDB composes established primitives; it does not define a cipher, KDF, signature scheme, or hash function.
 
 ## Document encryption
 
@@ -30,4 +30,4 @@ State checkpoints commit to live records and tombstones in canonical namespace o
 
 ## Limits
 
-This is not blockchain consensus. Signatures prove key possession and provenance, not authorization. A self-consistent old database requires an externally retained checkpoint to detect rollback. There is no searchable encryption, blind index, deterministic encryption, order leakage mechanism, key revocation protocol, hardware-backed custody, or automatic re-encryption during rotation.
+This is not blockchain consensus. Signatures prove key possession and provenance, not authorization. A self-consistent old database requires an externally retained checkpoint to detect rollback. Metadata indexes do not inspect plaintext. There is no searchable encryption, blind index, deterministic encryption, order leakage mechanism, key revocation protocol, hardware-backed custody, or automatic re-encryption during rotation.

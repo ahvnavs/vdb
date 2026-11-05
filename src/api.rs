@@ -1,70 +1,295 @@
-use std::sync::Arc;
-
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    body::Bytes,
+    extract::{Extension, Path, State},
     http::StatusCode,
-    routing::{get, put},
+    response::IntoResponse,
+    routing::{delete, get, post},
 };
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::{error::StoreError, model::EncryptedDocument, store::Store};
+use crate::{
+    error::StoreError,
+    network::{ApiError, AppState, RequestContext},
+    protocol::{
+        DatabaseService, DeleteDocumentRequest, PROTOCOL_VERSION, ProtocolRequest,
+        ProtocolResponse, PutDocumentRequest,
+    },
+    query::{IndexDefinition, Query},
+};
 
-pub fn router(store: Arc<Store>) -> Router {
+pub(crate) fn router(state: AppState) -> Router {
     Router::new()
-        .route("/health", get(health))
-        .route("/v1/{collection}/{id}", put(put_doc).get(get_doc))
+        .route("/healthz", get(health))
+        .route("/readyz", get(readiness))
+        .route(
+            "/v1/documents/{collection}/{id}",
+            get(get_document).put(put_document).delete(delete_document),
+        )
+        .route("/v1/query", post(query))
+        .route("/v1/explain", post(explain))
         .route("/v1/verify", get(verify))
-        .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
-        .with_state(store)
+        .route("/v1/metrics", get(metrics))
+        .route(
+            "/v1/indexes/{collection}",
+            get(list_indexes).post(create_index),
+        )
+        .route(
+            "/v1/indexes/{collection}/{name}",
+            delete(drop_index).put(rebuild_index),
+        )
+        .fallback(not_found)
+        .with_state(state)
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
+async fn health(Extension(context): Extension<RequestContext>) -> Json<Value> {
+    Json(
+        json!({"status": "ok", "protocol_version": PROTOCOL_VERSION, "request_id": context.request_id}),
+    )
 }
 
-async fn put_doc(
-    State(store): State<Arc<Store>>,
+async fn readiness(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<Value>, ApiError> {
+    state.service.readiness().map_err(|error| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_ready",
+            error.to_string(),
+            &context.request_id,
+        )
+    })?;
+    Ok(Json(
+        json!({"status": "ready", "protocol_version": PROTOCOL_VERSION, "request_id": context.request_id}),
+    ))
+}
+
+async fn get_document(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Path((collection, id)): Path<(String, String)>,
-    Json(mut doc): Json<EncryptedDocument>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    if doc.collection != collection || doc.id != id {
-        return Err((
+) -> Result<Json<ProtocolResponse>, ApiError> {
+    execute(
+        &state.service,
+        ProtocolRequest::GetDocument { collection, id },
+        &context,
+    )
+    .await
+}
+
+async fn put_document(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+    Path((collection, id)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<ProtocolResponse>, ApiError> {
+    let request: PutDocumentRequest = parse_json(&body, &context)?;
+    if request.document.collection != collection || request.document.id != id {
+        return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "path and envelope identity differ"})),
+            "identity_mismatch",
+            "path and encrypted-envelope identity differ",
+            context.request_id,
         ));
     }
-    doc.collection = collection;
-    doc.id = id;
-    store
-        .put(&doc)
-        .map(|m| Json(json!({"ok": true, "mutation": m})))
-        .map_err(internal)
+    execute(
+        &state.service,
+        ProtocolRequest::PutDocument(request),
+        &context,
+    )
+    .await
 }
 
-async fn get_doc(
-    State(store): State<Arc<Store>>,
+async fn delete_document(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Path((collection, id)): Path<(String, String)>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    match store.get(&collection, &id).map_err(internal)? {
-        Some(doc) => Ok(Json(json!(doc))),
-        None => Err((StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))),
+    body: Bytes,
+) -> Result<Json<ProtocolResponse>, ApiError> {
+    let request = parse_json::<DeleteDocumentRequest>(&body, &context)?;
+    execute(
+        &state.service,
+        ProtocolRequest::DeleteDocument {
+            collection,
+            id,
+            request,
+        },
+        &context,
+    )
+    .await
+}
+
+async fn query(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+    body: Bytes,
+) -> Result<Json<ProtocolResponse>, ApiError> {
+    execute(
+        &state.service,
+        ProtocolRequest::Query(parse_json::<Query>(&body, &context)?),
+        &context,
+    )
+    .await
+}
+
+async fn explain(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+    body: Bytes,
+) -> Result<Json<ProtocolResponse>, ApiError> {
+    execute(
+        &state.service,
+        ProtocolRequest::Explain(parse_json::<Query>(&body, &context)?),
+        &context,
+    )
+    .await
+}
+
+async fn verify(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<Json<ProtocolResponse>, ApiError> {
+    execute(&state.service, ProtocolRequest::Verify, &context).await
+}
+
+async fn metrics(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+) -> Result<impl IntoResponse, ApiError> {
+    let status = state
+        .service
+        .status()
+        .await
+        .map_err(|error| store_error(error, &context))?;
+    let mut output = state.metrics.prometheus();
+    output.push_str(&format!(
+        "# TYPE vdb_storage_bytes gauge\nvdb_storage_bytes {}\n# TYPE vdb_storage_fragmented_bytes gauge\nvdb_storage_fragmented_bytes {}\n# TYPE vdb_documents gauge\nvdb_documents {}\n# TYPE vdb_tombstones gauge\nvdb_tombstones {}\n# TYPE vdb_mutations_verified gauge\nvdb_mutations_verified {}\n# TYPE vdb_replication_events gauge\nvdb_replication_events {}\n# TYPE vdb_replication_pending_events gauge\nvdb_replication_pending_events {}\n# TYPE vdb_replication_conflicted_documents gauge\nvdb_replication_conflicted_documents {}\n# TYPE vdb_verification_valid gauge\nvdb_verification_valid {}\n",
+        status.storage.stored_bytes,
+        status.storage.fragmented_bytes,
+        status.storage.documents,
+        status.storage.tombstones,
+        status.verification.signed_mutations_verified,
+        status.replication.events,
+        status.replication.pending_events,
+        status.replication.conflicted_documents,
+        u8::from(status.verification.valid),
+    ));
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        output,
+    ))
+}
+
+async fn list_indexes(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+    Path(collection): Path<String>,
+) -> Result<Json<ProtocolResponse>, ApiError> {
+    execute(
+        &state.service,
+        ProtocolRequest::ListIndexes { collection },
+        &context,
+    )
+    .await
+}
+
+async fn create_index(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+    Path(collection): Path<String>,
+    body: Bytes,
+) -> Result<Json<ProtocolResponse>, ApiError> {
+    let index = parse_json::<IndexDefinition>(&body, &context)?;
+    if index.collection != collection {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "identity_mismatch",
+            "path and index collection differ",
+            context.request_id,
+        ));
     }
+    execute(
+        &state.service,
+        ProtocolRequest::CreateIndex(index),
+        &context,
+    )
+    .await
 }
 
-async fn verify(State(store): State<Arc<Store>>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    store.verify().map(|r| Json(json!(r))).map_err(internal)
+async fn drop_index(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+    Path((collection, name)): Path<(String, String)>,
+) -> Result<Json<ProtocolResponse>, ApiError> {
+    execute(
+        &state.service,
+        ProtocolRequest::DropIndex { collection, name },
+        &context,
+    )
+    .await
 }
 
-fn internal(err: StoreError) -> (StatusCode, Json<Value>) {
-    eprintln!("request failed: {err:#}");
-    let (status, message) = match &err {
-        StoreError::Conflict { .. } => (StatusCode::CONFLICT, err.to_string()),
-        StoreError::InvalidInput(_) => (StatusCode::BAD_REQUEST, err.to_string()),
-        _ => (
+async fn rebuild_index(
+    State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
+    Path((collection, name)): Path<(String, String)>,
+) -> Result<Json<ProtocolResponse>, ApiError> {
+    execute(
+        &state.service,
+        ProtocolRequest::RebuildIndex { collection, name },
+        &context,
+    )
+    .await
+}
+
+async fn not_found(Extension(context): Extension<RequestContext>) -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "route does not exist",
+        context.request_id,
+    )
+}
+
+fn parse_json<T: DeserializeOwned>(body: &[u8], context: &RequestContext) -> Result<T, ApiError> {
+    serde_json::from_slice(body).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "malformed_json",
+            "request body is not valid for this operation",
+            &context.request_id,
+        )
+    })
+}
+
+async fn execute(
+    service: &DatabaseService,
+    request: ProtocolRequest,
+    context: &RequestContext,
+) -> Result<Json<ProtocolResponse>, ApiError> {
+    service
+        .execute(request)
+        .await
+        .map(Json)
+        .map_err(|error| store_error(error, context))
+}
+
+fn store_error(error: StoreError, context: &RequestContext) -> ApiError {
+    let (status, code, message) = match error {
+        StoreError::InvalidInput(message) => (StatusCode::BAD_REQUEST, "invalid_input", message),
+        StoreError::Conflict { .. } => (StatusCode::CONFLICT, "conflict", error.to_string()),
+        StoreError::UnsupportedFormat { .. }
+        | StoreError::Corruption(_)
+        | StoreError::Storage(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "internal server error".to_owned(),
+            "internal_error",
+            "internal server error".into(),
         ),
     };
-    (status, Json(json!({"error": message})))
+    ApiError::new(status, code, message, &context.request_id)
 }

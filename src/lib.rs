@@ -5,6 +5,11 @@ pub mod history;
 pub mod identity;
 pub mod merkle;
 pub mod model;
+pub mod network;
+pub mod operations;
+pub mod protocol;
+pub mod query;
+pub mod replication;
 pub mod store;
 
 mod codec;

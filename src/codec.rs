@@ -81,4 +81,8 @@ impl<'a> Decoder<'a> {
         }
         Ok(())
     }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
 }

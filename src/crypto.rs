@@ -19,6 +19,8 @@ const KEY_WRAP_FORMAT: u8 = 1;
 const ARGON2_MEMORY_KIB: u32 = 19 * 1024;
 const ARGON2_ITERATIONS: u32 = 3;
 const ARGON2_PARALLELISM: u32 = 1;
+const MAX_CIPHERTEXT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CIPHERTEXT_B64: usize = MAX_CIPHERTEXT_BYTES.div_ceil(3) * 4;
 
 pub struct DatabaseKey {
     key_id: [u8; 16],
@@ -57,9 +59,10 @@ impl DatabaseKey {
     /// Transitional CLI import for a raw version-1 secret. The database-scoped key ID
     /// prevents correlation when the same secret is reused across databases.
     pub fn from_database_secret(database_id: &str, mut secret: [u8; 32]) -> Result<Self> {
-        let valid_database_id = hex::decode(database_id)
-            .map(|decoded| decoded.len() == 16)
-            .unwrap_or(false);
+        let valid_database_id = database_id.len() == 32
+            && hex::decode(database_id)
+                .map(|decoded| decoded.len() == 16)
+                .unwrap_or(false);
         if !valid_database_id {
             secret.zeroize();
             return Err(anyhow!("invalid database ID"));
@@ -139,6 +142,9 @@ impl DatabaseKey {
         }
         let salt = decode_exact::<16>(&wrapped.salt_b64, "key-wrap salt")?;
         let nonce = decode_exact::<24>(&wrapped.nonce_b64, "key-wrap nonce")?;
+        if wrapped.ciphertext_b64.len() > 128 {
+            return Err(anyhow!("invalid wrapped-key ciphertext length"));
+        }
         let ciphertext = B64
             .decode(&wrapped.ciphertext_b64)
             .map_err(|_| anyhow!("invalid wrapped-key ciphertext"))?;
@@ -173,6 +179,9 @@ pub fn generate_key() -> Result<[u8; 32]> {
 }
 
 pub fn key_from_hex(input: &str) -> Result<[u8; 32]> {
+    if input.len() != 64 {
+        return Err(anyhow!("key must be exactly 32 bytes / 64 hex characters"));
+    }
     Zeroizing::new(hex::decode(input)?)
         .as_slice()
         .try_into()
@@ -199,6 +208,9 @@ impl WrappedDatabaseKey {
     }
 
     pub fn from_json(encoded: &str) -> Result<Self> {
+        if encoded.len() > 16 * 1024 {
+            return Err(anyhow!("wrapped-key document is too large"));
+        }
         let wrapped: Self = serde_json::from_str(encoded)
             .map_err(|error| anyhow!("invalid wrapped-key document: {error}"))?;
         wrapped.validate_policy()?;
@@ -327,15 +339,20 @@ pub fn validate_envelope(document: &EncryptedDocument) -> Result<()> {
     {
         return Err(anyhow!("unsupported encrypted envelope"));
     }
-    if hex::decode(&document.database_id)?.len() != 16 || hex::decode(&document.key_id)?.len() != 16
+    if document.key_id.len() != 32
+        || hex::decode(&document.database_id)?.len() != 16
+        || hex::decode(&document.key_id)?.len() != 16
     {
         return Err(anyhow!("invalid database or key ID"));
     }
     decode_exact::<24>(&document.nonce_b64, "XChaCha20 nonce")?;
+    if document.ciphertext_b64.len() > MAX_CIPHERTEXT_B64 {
+        return Err(anyhow!("invalid ciphertext length"));
+    }
     let ciphertext = B64
         .decode(&document.ciphertext_b64)
         .map_err(|_| anyhow!("invalid ciphertext encoding"))?;
-    if ciphertext.len() < 16 || ciphertext.len() > 4 * 1024 * 1024 {
+    if ciphertext.len() < 16 || ciphertext.len() > MAX_CIPHERTEXT_BYTES {
         return Err(anyhow!("invalid ciphertext length"));
     }
     Ok(())
@@ -448,6 +465,10 @@ fn append_field(output: &mut Vec<u8>, field: &[u8]) {
 }
 
 fn decode_exact<const N: usize>(encoded: &str, name: &str) -> Result<[u8; N]> {
+    let expected_encoded_len = N.div_ceil(3) * 4;
+    if encoded.len() != expected_encoded_len {
+        return Err(anyhow!("invalid {name} length"));
+    }
     B64.decode(encoded)
         .map_err(|_| anyhow!("invalid {name} encoding"))?
         .try_into()
@@ -560,6 +581,10 @@ mod tests {
         let mut document = encrypt_document(&key, DB, "users", "alice", 1, b"{}")?;
         document.nonce_b64 = "AA==".into();
         assert!(decrypt_document(&key, &document).is_err());
+
+        let mut document = encrypt_document(&key, DB, "users", "alice", 1, b"{}")?;
+        document.ciphertext_b64 = "A".repeat(MAX_CIPHERTEXT_B64 + 1);
+        assert!(validate_envelope(&document).is_err());
         Ok(())
     }
 }

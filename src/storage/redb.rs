@@ -21,7 +21,12 @@ use crate::{
         EncryptedDocument, InclusionProof, MutationKind, MutationRecord, StateCheckpoint,
         VerifyReport, VersionPrecondition, WriteOperation,
     },
-    storage::{StorageEngine, StorageSnapshot},
+    query::{
+        IndexDefinition, MAX_QUERY_SCAN_BYTES, MAX_QUERY_SCAN_ROWS, MetadataField, QueryValue,
+        field_value,
+    },
+    replication::{ReplicationEvent, decode_event, encode_event, verify_event},
+    storage::{BackupImage, BackupTable, StorageEngine, StorageSnapshot, StorageStatistics},
 };
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("vdb1.metadata");
@@ -30,6 +35,13 @@ const PAYLOADS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vdb1.paylo
 const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("vdb1.mutation_log");
 const WRITERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vdb1.writer_keys");
 const MUTATION_IDS: TableDefinition<&[u8], u64> = TableDefinition::new("vdb1.mutation_ids");
+const INDEX_DEFINITIONS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("vdb1.index_definitions");
+const INDEX_ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("vdb1.index_entries");
+const REPLICATION_EVENTS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("vdb1.replication_events");
+const REPLICATION_DOTS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("vdb1.replication_dots");
 const HEADER_KEY: &str = "database_header";
 const SEQUENCE_KEY: &str = "mutation_sequence";
 const HEAD_KEY: &str = "mutation_head";
@@ -72,9 +84,54 @@ impl RedbEngine {
             tx.open_table(LOG).map_err(storage)?;
             tx.open_table(WRITERS).map_err(storage)?;
             tx.open_table(MUTATION_IDS).map_err(storage)?;
+            tx.open_table(INDEX_DEFINITIONS).map_err(storage)?;
+            tx.open_table(INDEX_ENTRIES).map_err(storage)?;
+            tx.open_table(REPLICATION_EVENTS).map_err(storage)?;
+            tx.open_table(REPLICATION_DOTS).map_err(storage)?;
         }
         tx.commit().map_err(storage)?;
         Ok(Self { db: Arc::new(db) })
+    }
+
+    pub(crate) fn restore_image(path: impl AsRef<Path>, image: &BackupImage) -> Result<()> {
+        let db = Database::create(path).map_err(map_database_error)?;
+        let tx = db.begin_write().map_err(storage)?;
+        for table in &image.tables {
+            match table.id {
+                1 => {
+                    let mut target = tx.open_table(META).map_err(storage)?;
+                    for (key, value) in &table.rows {
+                        let key = std::str::from_utf8(key).map_err(corruption)?;
+                        target.insert(key, value.as_slice()).map_err(storage)?;
+                    }
+                }
+                2 => restore_bytes_table(&tx, DOCUMENT_META, &table.rows)?,
+                3 => restore_bytes_table(&tx, PAYLOADS, &table.rows)?,
+                4 => {
+                    let mut target = tx.open_table(LOG).map_err(storage)?;
+                    for (key, value) in &table.rows {
+                        let key =
+                            u64::from_be_bytes(key.as_slice().try_into().map_err(corruption)?);
+                        target.insert(key, value.as_slice()).map_err(storage)?;
+                    }
+                }
+                5 => restore_bytes_table(&tx, WRITERS, &table.rows)?,
+                6 => {
+                    let mut target = tx.open_table(MUTATION_IDS).map_err(storage)?;
+                    for (key, value) in &table.rows {
+                        let value =
+                            u64::from_be_bytes(value.as_slice().try_into().map_err(corruption)?);
+                        target.insert(key.as_slice(), value).map_err(storage)?;
+                    }
+                }
+                7 => restore_bytes_table(&tx, INDEX_DEFINITIONS, &table.rows)?,
+                8 => restore_bytes_table(&tx, INDEX_ENTRIES, &table.rows)?,
+                9 => restore_bytes_table(&tx, REPLICATION_EVENTS, &table.rows)?,
+                10 => restore_bytes_table(&tx, REPLICATION_DOTS, &table.rows)?,
+                _ => return Err(corruption("unknown backup table identifier")),
+            }
+        }
+        tx.commit().map_err(storage)
     }
 }
 
@@ -118,6 +175,15 @@ impl StorageEngine for RedbEngine {
 
         let tx = self.db.begin_write().map_err(storage)?;
         let mut records = Vec::with_capacity(operations.len());
+        let index_definitions = {
+            let table = tx.open_table(INDEX_DEFINITIONS).map_err(storage)?;
+            let mut definitions = Vec::new();
+            for item in table.iter().map_err(storage)? {
+                let (_, value) = item.map_err(storage)?;
+                definitions.push(decode_index_definition(value.value())?);
+            }
+            definitions
+        };
         {
             let mut metadata_table = tx.open_table(DOCUMENT_META).map_err(storage)?;
             let mut payload_table = tx.open_table(PAYLOADS).map_err(storage)?;
@@ -125,6 +191,7 @@ impl StorageEngine for RedbEngine {
             let mut meta = tx.open_table(META).map_err(storage)?;
             let mut writers = tx.open_table(WRITERS).map_err(storage)?;
             let mut mutation_ids = tx.open_table(MUTATION_IDS).map_err(storage)?;
+            let mut index_entries = tx.open_table(INDEX_ENTRIES).map_err(storage)?;
             let mut sequence = read_sequence(&meta)?;
             let mut head = read_head(&meta)?;
             let database_id = {
@@ -156,6 +223,24 @@ impl StorageEngine for RedbEngine {
                     .map_err(storage)?
                     .map(|value| decode_document_metadata(value.value()))
                     .transpose()?;
+                let existing_record = existing
+                    .as_ref()
+                    .map(|metadata| {
+                        let payload = if metadata.deleted {
+                            None
+                        } else {
+                            let value = payload_table
+                                .get(key.as_slice())
+                                .map_err(storage)?
+                                .ok_or_else(|| corruption("live document payload missing"))?;
+                            Some(decode_document(value.value())?)
+                        };
+                        Ok(DocumentRecord {
+                            metadata: metadata.clone(),
+                            payload,
+                        })
+                    })
+                    .transpose()?;
                 check_precondition(
                     collection,
                     id,
@@ -166,7 +251,7 @@ impl StorageEngine for RedbEngine {
                     .checked_add(1)
                     .ok_or_else(|| corruption("mutation sequence overflow"))?;
 
-                let (metadata, payload, kind) = match operation {
+                let (metadata, payload, payload_document, kind) = match operation {
                     WriteOperation::Put { document, .. } => {
                         validate_document(document, &database_id)?;
                         ensure_newer(collection, id, existing.as_ref(), document.version)?;
@@ -186,6 +271,7 @@ impl StorageEngine for RedbEngine {
                                 payload_hash: Some(payload_hash),
                             },
                             Some(bytes),
+                            Some(document.clone()),
                             MutationKind::Put,
                         )
                     }
@@ -204,6 +290,7 @@ impl StorageEngine for RedbEngine {
                                 deleted: true,
                                 payload_hash: None,
                             },
+                            None,
                             None,
                             MutationKind::Delete,
                         )
@@ -245,6 +332,26 @@ impl StorageEngine for RedbEngine {
                         expected: "unique mutation id".into(),
                         actual: record.mutation_id.clone(),
                     });
+                }
+
+                for definition in index_definitions
+                    .iter()
+                    .filter(|definition| definition.collection == collection)
+                {
+                    if let Some(record) = &existing_record
+                        && let Some(entry) = index_entry_key(definition, record)
+                    {
+                        index_entries.remove(entry.as_slice()).map_err(storage)?;
+                    }
+                    let new_record = DocumentRecord {
+                        metadata: metadata.clone(),
+                        payload: payload_document.clone(),
+                    };
+                    if let Some(entry) = index_entry_key(definition, &new_record) {
+                        index_entries
+                            .insert(entry.as_slice(), key.as_slice())
+                            .map_err(storage)?;
+                    }
                 }
 
                 metadata_table
@@ -307,6 +414,115 @@ impl StorageEngine for RedbEngine {
                 .map(hex::encode)
                 .collect(),
         }))
+    }
+
+    fn list_indexes(&self, collection: &str) -> Result<Vec<IndexDefinition>> {
+        validate_identity(collection, "index-placeholder")?;
+        let tx = self.db.begin_read().map_err(storage)?;
+        let table = tx.open_table(INDEX_DEFINITIONS).map_err(storage)?;
+        let mut definitions = Vec::new();
+        for item in table.iter().map_err(storage)? {
+            let (_, value) = item.map_err(storage)?;
+            let definition = decode_index_definition(value.value())?;
+            if definition.collection == collection {
+                definitions.push(definition);
+            }
+        }
+        definitions.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(definitions)
+    }
+
+    fn create_index(&self, index: &IndexDefinition) -> Result<()> {
+        validate_index_definition(index)?;
+        let tx = self.db.begin_write().map_err(storage)?;
+        {
+            let key = index_definition_key(&index.collection, &index.name);
+            let mut definitions = tx.open_table(INDEX_DEFINITIONS).map_err(storage)?;
+            if definitions.get(key.as_slice()).map_err(storage)?.is_some() {
+                return Err(StoreError::Conflict {
+                    collection: index.collection.clone(),
+                    id: index.name.clone(),
+                    expected: "index name to be absent".into(),
+                    actual: "index already exists".into(),
+                });
+            }
+            let encoded = encode_index_definition(index);
+            definitions
+                .insert(key.as_slice(), encoded.as_slice())
+                .map_err(storage)?;
+
+            let metadata = tx.open_table(DOCUMENT_META).map_err(storage)?;
+            let payloads = tx.open_table(PAYLOADS).map_err(storage)?;
+            let mut entries = tx.open_table(INDEX_ENTRIES).map_err(storage)?;
+            for item in metadata.iter().map_err(storage)? {
+                let (document_key, value) = item.map_err(storage)?;
+                let record = record_from_tables(&payloads, document_key.value(), value.value())?;
+                if record.metadata.collection == index.collection
+                    && let Some(entry) = index_entry_key(index, &record)
+                {
+                    entries
+                        .insert(entry.as_slice(), document_key.value())
+                        .map_err(storage)?;
+                }
+            }
+        }
+        tx.commit().map_err(storage)
+    }
+
+    fn drop_index(&self, collection: &str, name: &str) -> Result<()> {
+        validate_index_name(collection, name)?;
+        let tx = self.db.begin_write().map_err(storage)?;
+        {
+            let key = index_definition_key(collection, name);
+            let mut definitions = tx.open_table(INDEX_DEFINITIONS).map_err(storage)?;
+            if definitions
+                .remove(key.as_slice())
+                .map_err(storage)?
+                .is_none()
+            {
+                return Err(StoreError::InvalidInput("index does not exist".into()));
+            }
+            let prefix = index_namespace_prefix(collection, name);
+            let mut entries = tx.open_table(INDEX_ENTRIES).map_err(storage)?;
+            let keys = keys_with_prefix(&entries, &prefix)?;
+            for key in keys {
+                entries.remove(key.as_slice()).map_err(storage)?;
+            }
+        }
+        tx.commit().map_err(storage)
+    }
+
+    fn rebuild_index(&self, collection: &str, name: &str) -> Result<()> {
+        validate_index_name(collection, name)?;
+        let tx = self.db.begin_write().map_err(storage)?;
+        {
+            let definition_key = index_definition_key(collection, name);
+            let definitions = tx.open_table(INDEX_DEFINITIONS).map_err(storage)?;
+            let definition = definitions
+                .get(definition_key.as_slice())
+                .map_err(storage)?
+                .ok_or_else(|| StoreError::InvalidInput("index does not exist".into()))
+                .and_then(|value| decode_index_definition(value.value()))?;
+            let metadata = tx.open_table(DOCUMENT_META).map_err(storage)?;
+            let payloads = tx.open_table(PAYLOADS).map_err(storage)?;
+            let mut entries = tx.open_table(INDEX_ENTRIES).map_err(storage)?;
+            let prefix = index_namespace_prefix(collection, name);
+            for key in keys_with_prefix(&entries, &prefix)? {
+                entries.remove(key.as_slice()).map_err(storage)?;
+            }
+            for item in metadata.iter().map_err(storage)? {
+                let (document_key, value) = item.map_err(storage)?;
+                let record = record_from_tables(&payloads, document_key.value(), value.value())?;
+                if record.metadata.collection == collection
+                    && let Some(entry) = index_entry_key(&definition, &record)
+                {
+                    entries
+                        .insert(entry.as_slice(), document_key.value())
+                        .map_err(storage)?;
+                }
+            }
+        }
+        tx.commit().map_err(storage)
     }
 
     fn verify(&self) -> Result<VerifyReport> {
@@ -426,6 +642,75 @@ impl StorageEngine for RedbEngine {
                 "mutation references missing current document",
             ));
         }
+        let definitions_table = tx.open_table(INDEX_DEFINITIONS).map_err(storage)?;
+        let mut definitions = Vec::new();
+        for item in definitions_table.iter().map_err(storage)? {
+            let (_, value) = item.map_err(storage)?;
+            definitions.push(decode_index_definition(value.value())?);
+        }
+        let mut expected_entries = HashMap::<Vec<u8>, Vec<u8>>::new();
+        for item in docs.iter().map_err(storage)? {
+            let (key, value) = item.map_err(storage)?;
+            let record = record_from_tables(&payloads, key.value(), value.value())?;
+            for definition in definitions
+                .iter()
+                .filter(|definition| definition.collection == record.metadata.collection)
+            {
+                if let Some(entry) = index_entry_key(definition, &record) {
+                    expected_entries.insert(entry, key.value().to_vec());
+                }
+            }
+        }
+        let entries = tx.open_table(INDEX_ENTRIES).map_err(storage)?;
+        let mut actual_entries = HashMap::new();
+        for item in entries.iter().map_err(storage)? {
+            let (key, value) = item.map_err(storage)?;
+            actual_entries.insert(key.value().to_vec(), value.value().to_vec());
+        }
+        if actual_entries != expected_entries {
+            return Ok(invalid_report(
+                count,
+                &previous,
+                "secondary index state mismatch",
+            ));
+        }
+        let replication_events = tx.open_table(REPLICATION_EVENTS).map_err(storage)?;
+        let replication_dots = tx.open_table(REPLICATION_DOTS).map_err(storage)?;
+        let mut replication_count = 0_u64;
+        for item in replication_events.iter().map_err(storage)? {
+            let (key, value) = item.map_err(storage)?;
+            let event = decode_event(value.value())?;
+            if key.value() != event.event_id.as_bytes()
+                || verify_event(&event, &database_id).is_err()
+            {
+                return Ok(invalid_report(
+                    count,
+                    &previous,
+                    "invalid replication event",
+                ));
+            }
+            let dot = replication_dot_key(&event.replica_id, event.counter);
+            if replication_dots
+                .get(dot.as_slice())
+                .map_err(storage)?
+                .map(|value| value.value().to_vec())
+                != Some(event.event_id.as_bytes().to_vec())
+            {
+                return Ok(invalid_report(
+                    count,
+                    &previous,
+                    "replication dot index mismatch",
+                ));
+            }
+            replication_count += 1;
+        }
+        if replication_dots.len().map_err(storage)? != replication_count {
+            return Ok(invalid_report(
+                count,
+                &previous,
+                "replication dot index cardinality mismatch",
+            ));
+        }
         Ok(VerifyReport {
             valid: true,
             mutations: count,
@@ -433,6 +718,204 @@ impl StorageEngine for RedbEngine {
             error: None,
         })
     }
+
+    fn replication_events(&self) -> Result<Vec<ReplicationEvent>> {
+        let tx = self.db.begin_read().map_err(storage)?;
+        let table = tx.open_table(REPLICATION_EVENTS).map_err(storage)?;
+        let mut events = Vec::new();
+        for item in table.iter().map_err(storage)? {
+            let (key, value) = item.map_err(storage)?;
+            let event = decode_event(value.value())?;
+            if key.value() != event.event_id.as_bytes() {
+                return Err(corruption("replication event key mismatch"));
+            }
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    fn store_replication_events(&self, events: &[ReplicationEvent]) -> Result<usize> {
+        let tx = self.db.begin_write().map_err(storage)?;
+        let mut accepted = 0;
+        {
+            let mut stored = tx.open_table(REPLICATION_EVENTS).map_err(storage)?;
+            let mut dots = tx.open_table(REPLICATION_DOTS).map_err(storage)?;
+            for event in events {
+                let dot = replication_dot_key(&event.replica_id, event.counter);
+                if let Some(existing) = dots.get(dot.as_slice()).map_err(storage)? {
+                    if existing.value() != event.event_id.as_bytes() {
+                        return Err(StoreError::Conflict {
+                            collection: event.collection.clone(),
+                            id: event.id.clone(),
+                            expected: "one event per replica counter".into(),
+                            actual: "replica equivocation".into(),
+                        });
+                    }
+                    continue;
+                }
+                if stored
+                    .get(event.event_id.as_bytes())
+                    .map_err(storage)?
+                    .is_some()
+                {
+                    return Err(corruption("replication event exists without its dot index"));
+                }
+                let encoded = encode_event(event);
+                stored
+                    .insert(event.event_id.as_bytes(), encoded.as_slice())
+                    .map_err(storage)?;
+                dots.insert(dot.as_slice(), event.event_id.as_bytes())
+                    .map_err(storage)?;
+                accepted += 1;
+            }
+        }
+        tx.commit().map_err(storage)?;
+        Ok(accepted)
+    }
+
+    fn backup_image(&self) -> Result<BackupImage> {
+        let tx = self.db.begin_read().map_err(storage)?;
+        let mut tables = Vec::with_capacity(10);
+        let meta = tx.open_table(META).map_err(storage)?;
+        let mut rows = Vec::new();
+        for item in meta.iter().map_err(storage)? {
+            let (key, value) = item.map_err(storage)?;
+            rows.push((key.value().as_bytes().to_vec(), value.value().to_vec()));
+        }
+        tables.push(BackupTable { id: 1, rows });
+        tables.push(BackupTable {
+            id: 2,
+            rows: collect_bytes_table(&tx.open_table(DOCUMENT_META).map_err(storage)?)?,
+        });
+        tables.push(BackupTable {
+            id: 3,
+            rows: collect_bytes_table(&tx.open_table(PAYLOADS).map_err(storage)?)?,
+        });
+        let log = tx.open_table(LOG).map_err(storage)?;
+        let mut rows = Vec::new();
+        for item in log.iter().map_err(storage)? {
+            let (key, value) = item.map_err(storage)?;
+            rows.push((key.value().to_be_bytes().to_vec(), value.value().to_vec()));
+        }
+        tables.push(BackupTable { id: 4, rows });
+        tables.push(BackupTable {
+            id: 5,
+            rows: collect_bytes_table(&tx.open_table(WRITERS).map_err(storage)?)?,
+        });
+        let mutation_ids = tx.open_table(MUTATION_IDS).map_err(storage)?;
+        let mut rows = Vec::new();
+        for item in mutation_ids.iter().map_err(storage)? {
+            let (key, value) = item.map_err(storage)?;
+            rows.push((key.value().to_vec(), value.value().to_be_bytes().to_vec()));
+        }
+        tables.push(BackupTable { id: 6, rows });
+        tables.push(BackupTable {
+            id: 7,
+            rows: collect_bytes_table(&tx.open_table(INDEX_DEFINITIONS).map_err(storage)?)?,
+        });
+        tables.push(BackupTable {
+            id: 8,
+            rows: collect_bytes_table(&tx.open_table(INDEX_ENTRIES).map_err(storage)?)?,
+        });
+        tables.push(BackupTable {
+            id: 9,
+            rows: collect_bytes_table(&tx.open_table(REPLICATION_EVENTS).map_err(storage)?)?,
+        });
+        tables.push(BackupTable {
+            id: 10,
+            rows: collect_bytes_table(&tx.open_table(REPLICATION_DOTS).map_err(storage)?)?,
+        });
+        Ok(BackupImage { tables })
+    }
+
+    fn statistics(&self) -> Result<StorageStatistics> {
+        let tx = self.db.begin_write().map_err(storage)?;
+        let stats = tx.stats().map_err(storage)?;
+        let documents = tx.open_table(DOCUMENT_META).map_err(storage)?;
+        let mut live_documents = 0_u64;
+        let mut tombstones = 0_u64;
+        for item in documents.iter().map_err(storage)? {
+            let (_, value) = item.map_err(storage)?;
+            if decode_document_metadata(value.value())?.deleted {
+                tombstones += 1;
+            } else {
+                live_documents += 1;
+            }
+        }
+        let result = StorageStatistics {
+            allocated_pages: stats.allocated_pages(),
+            leaf_pages: stats.leaf_pages(),
+            branch_pages: stats.branch_pages(),
+            stored_bytes: stats.stored_bytes(),
+            metadata_bytes: stats.metadata_bytes(),
+            fragmented_bytes: stats.fragmented_bytes(),
+            page_size: stats.page_size(),
+            documents: documents.len().map_err(storage)?,
+            live_documents,
+            tombstones,
+            mutations: tx
+                .open_table(LOG)
+                .map_err(storage)?
+                .len()
+                .map_err(storage)?,
+            writers: tx
+                .open_table(WRITERS)
+                .map_err(storage)?
+                .len()
+                .map_err(storage)?,
+            indexes: tx
+                .open_table(INDEX_DEFINITIONS)
+                .map_err(storage)?
+                .len()
+                .map_err(storage)?,
+            index_entries: tx
+                .open_table(INDEX_ENTRIES)
+                .map_err(storage)?
+                .len()
+                .map_err(storage)?,
+            replication_events: tx
+                .open_table(REPLICATION_EVENTS)
+                .map_err(storage)?
+                .len()
+                .map_err(storage)?,
+        };
+        drop(documents);
+        tx.abort().map_err(storage)?;
+        Ok(result)
+    }
+}
+
+fn collect_bytes_table<T>(table: &T) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
+where
+    T: ReadableTable<&'static [u8], &'static [u8]>,
+{
+    let mut rows = Vec::new();
+    for item in table.iter().map_err(storage)? {
+        let (key, value) = item.map_err(storage)?;
+        rows.push((key.value().to_vec(), value.value().to_vec()));
+    }
+    Ok(rows)
+}
+
+fn restore_bytes_table(
+    tx: &redb::WriteTransaction,
+    definition: TableDefinition<&[u8], &[u8]>,
+    rows: &[(Vec<u8>, Vec<u8>)],
+) -> Result<()> {
+    let mut table = tx.open_table(definition).map_err(storage)?;
+    for (key, value) in rows {
+        table
+            .insert(key.as_slice(), value.as_slice())
+            .map_err(storage)?;
+    }
+    Ok(())
+}
+
+fn replication_dot_key(replica_id: &str, counter: u64) -> Vec<u8> {
+    let mut encoder = Encoder::new(b"vdb.replication.dot.v1\0");
+    encoder.string(replica_id);
+    encoder.u64(counter);
+    encoder.finish()
 }
 
 struct RedbSnapshot {
@@ -465,6 +948,117 @@ impl StorageSnapshot for RedbSnapshot {
             Some(decode_document(bytes.value())?)
         };
         Ok(Some(DocumentRecord { metadata, payload }))
+    }
+
+    fn scan_collection(&self, collection: &str) -> Result<Vec<DocumentRecord>> {
+        validate_identity(collection, "scan-placeholder")?;
+        let metadata = self.tx.open_table(DOCUMENT_META).map_err(storage)?;
+        let payloads = self.tx.open_table(PAYLOADS).map_err(storage)?;
+        let mut records = Vec::new();
+        let mut scanned = 0_usize;
+        let mut selected_bytes = 0_usize;
+        for item in metadata.iter().map_err(storage)? {
+            scanned = scanned
+                .checked_add(1)
+                .ok_or_else(|| StoreError::InvalidInput("query scan budget exceeded".into()))?;
+            if scanned > MAX_QUERY_SCAN_ROWS {
+                return Err(StoreError::InvalidInput(
+                    "query scan row budget exceeded".into(),
+                ));
+            }
+            let (key, value) = item.map_err(storage)?;
+            let record = record_from_tables(&payloads, key.value(), value.value())?;
+            if record.metadata.collection == collection {
+                selected_bytes = selected_bytes
+                    .checked_add(value.value().len())
+                    .and_then(|bytes| {
+                        record.payload.as_ref().map_or(Some(bytes), |payload| {
+                            bytes.checked_add(payload.ciphertext_b64.len())
+                        })
+                    })
+                    .ok_or_else(|| {
+                        StoreError::InvalidInput("query scan byte budget exceeded".into())
+                    })?;
+                if selected_bytes > MAX_QUERY_SCAN_BYTES {
+                    return Err(StoreError::InvalidInput(
+                        "query scan byte budget exceeded".into(),
+                    ));
+                }
+                records.push(record);
+            }
+        }
+        Ok(records)
+    }
+
+    fn lookup_index(
+        &self,
+        index: &IndexDefinition,
+        equality_prefix: &[QueryValue],
+    ) -> Result<Vec<DocumentRecord>> {
+        if equality_prefix.is_empty() || equality_prefix.len() > index.fields.len() {
+            return Err(StoreError::InvalidInput(
+                "invalid index equality prefix".into(),
+            ));
+        }
+        let prefix = index_value_prefix(index, equality_prefix);
+        let end =
+            prefix_successor(&prefix).ok_or_else(|| corruption("index prefix has no successor"))?;
+        let entries = self.tx.open_table(INDEX_ENTRIES).map_err(storage)?;
+        let metadata = self.tx.open_table(DOCUMENT_META).map_err(storage)?;
+        let payloads = self.tx.open_table(PAYLOADS).map_err(storage)?;
+        let mut records = Vec::new();
+        let mut selected_bytes = 0_usize;
+        for item in entries
+            .range(prefix.as_slice()..end.as_slice())
+            .map_err(storage)?
+        {
+            let (_, value) = item.map_err(storage)?;
+            let document_key = value.value();
+            let metadata_bytes = metadata
+                .get(document_key)
+                .map_err(storage)?
+                .ok_or_else(|| corruption("index references missing document"))?;
+            selected_bytes = selected_bytes
+                .checked_add(metadata_bytes.value().len())
+                .ok_or_else(|| {
+                    StoreError::InvalidInput("query scan byte budget exceeded".into())
+                })?;
+            if records.len() >= MAX_QUERY_SCAN_ROWS || selected_bytes > MAX_QUERY_SCAN_BYTES {
+                return Err(StoreError::InvalidInput(
+                    "query scan budget exceeded".into(),
+                ));
+            }
+            let record = record_from_tables(&payloads, document_key, metadata_bytes.value())?;
+            if let Some(payload) = &record.payload {
+                selected_bytes = selected_bytes
+                    .checked_add(payload.ciphertext_b64.len())
+                    .ok_or_else(|| {
+                        StoreError::InvalidInput("query scan byte budget exceeded".into())
+                    })?;
+            }
+            if selected_bytes > MAX_QUERY_SCAN_BYTES {
+                return Err(StoreError::InvalidInput(
+                    "query scan byte budget exceeded".into(),
+                ));
+            }
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    fn list_indexes(&self, collection: &str) -> Result<Vec<IndexDefinition>> {
+        validate_identity(collection, "index-placeholder")?;
+        let table = self.tx.open_table(INDEX_DEFINITIONS).map_err(storage)?;
+        let mut definitions = Vec::new();
+        for item in table.iter().map_err(storage)? {
+            let (_, value) = item.map_err(storage)?;
+            let definition = decode_index_definition(value.value())?;
+            if definition.collection == collection {
+                definitions.push(definition);
+            }
+        }
+        definitions.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(definitions)
     }
 }
 
@@ -581,6 +1175,188 @@ fn document_key(collection: &str, id: &str) -> Vec<u8> {
     e.string(collection);
     e.string(id);
     e.finish()
+}
+
+fn index_definition_key(collection: &str, name: &str) -> Vec<u8> {
+    let mut encoder = Encoder::new(b"vdb.index.definition.key.v1\0");
+    encoder.string(collection);
+    encoder.string(name);
+    encoder.finish()
+}
+
+fn index_namespace_prefix(collection: &str, name: &str) -> Vec<u8> {
+    let mut encoder = Encoder::new(b"vdb.index.entry.v1\0");
+    encoder.string(collection);
+    encoder.string(name);
+    encoder.finish()
+}
+
+fn index_value_prefix(index: &IndexDefinition, values: &[QueryValue]) -> Vec<u8> {
+    let mut encoded = index_namespace_prefix(&index.collection, &index.name);
+    for value in values {
+        encode_query_value(&mut encoded, value);
+    }
+    encoded
+}
+
+fn index_entry_key(index: &IndexDefinition, record: &DocumentRecord) -> Option<Vec<u8>> {
+    let values: Option<Vec<_>> = index
+        .fields
+        .iter()
+        .map(|field| field_value(record, *field))
+        .collect();
+    let mut encoded = index_value_prefix(index, &values?);
+    let key = document_key(&record.metadata.collection, &record.metadata.id);
+    encoded.extend_from_slice(&(key.len() as u64).to_be_bytes());
+    encoded.extend_from_slice(&key);
+    Some(encoded)
+}
+
+fn encode_query_value(encoded: &mut Vec<u8>, value: &QueryValue) {
+    match value {
+        QueryValue::String(value) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            encoded.extend_from_slice(value.as_bytes());
+        }
+        QueryValue::Number(value) => {
+            encoded.push(2);
+            encoded.extend_from_slice(&value.to_be_bytes());
+        }
+        QueryValue::Bool(value) => {
+            encoded.push(3);
+            encoded.push(u8::from(*value));
+        }
+    }
+}
+
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut result = prefix.to_vec();
+    for index in (0..result.len()).rev() {
+        if result[index] != u8::MAX {
+            result[index] += 1;
+            result.truncate(index + 1);
+            return Some(result);
+        }
+    }
+    None
+}
+
+fn validate_index_name(collection: &str, name: &str) -> Result<()> {
+    validate_identity(collection, name)?;
+    if name.len() > 128 {
+        return Err(StoreError::InvalidInput("index name is too long".into()));
+    }
+    Ok(())
+}
+
+fn validate_index_definition(index: &IndexDefinition) -> Result<()> {
+    validate_index_name(&index.collection, &index.name)?;
+    if index.fields.is_empty() || index.fields.len() > 4 {
+        return Err(StoreError::InvalidInput(
+            "an index must contain between one and four fields".into(),
+        ));
+    }
+    let unique: HashSet<_> = index.fields.iter().collect();
+    if unique.len() != index.fields.len() {
+        return Err(StoreError::InvalidInput(
+            "an index cannot repeat a field".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn encode_index_definition(index: &IndexDefinition) -> Vec<u8> {
+    let mut encoder = Encoder::new(b"vdb.index.definition.v1\0");
+    encoder.string(&index.name);
+    encoder.string(&index.collection);
+    encoder.u64(index.fields.len() as u64);
+    for field in &index.fields {
+        encoder.u8(index_field_tag(*field));
+    }
+    with_checksum(encoder.finish())
+}
+
+fn decode_index_definition(bytes: &[u8]) -> Result<IndexDefinition> {
+    let mut decoder = Decoder::new(checked_body(bytes)?, b"vdb.index.definition.v1\0")?;
+    let name = decoder.string(128)?;
+    let collection = decoder.string(MAX_NAME)?;
+    let count = usize::try_from(decoder.u64()?).map_err(corruption)?;
+    if count == 0 || count > 4 {
+        return Err(corruption("invalid index field count"));
+    }
+    let mut fields = Vec::with_capacity(count);
+    for _ in 0..count {
+        fields.push(index_field_from_tag(decoder.u8()?)?);
+    }
+    decoder.finish()?;
+    let definition = IndexDefinition {
+        name,
+        collection,
+        fields,
+    };
+    validate_index_definition(&definition).map_err(|error| corruption(error.to_string()))?;
+    Ok(definition)
+}
+
+fn index_field_tag(field: MetadataField) -> u8 {
+    match field {
+        MetadataField::DocumentId => 1,
+        MetadataField::Version => 2,
+        MetadataField::CreatedSequence => 3,
+        MetadataField::ModifiedSequence => 4,
+        MetadataField::Deleted => 5,
+        MetadataField::KeyId => 6,
+        MetadataField::KeyVersion => 7,
+    }
+}
+
+fn index_field_from_tag(tag: u8) -> Result<MetadataField> {
+    match tag {
+        1 => Ok(MetadataField::DocumentId),
+        2 => Ok(MetadataField::Version),
+        3 => Ok(MetadataField::CreatedSequence),
+        4 => Ok(MetadataField::ModifiedSequence),
+        5 => Ok(MetadataField::Deleted),
+        6 => Ok(MetadataField::KeyId),
+        7 => Ok(MetadataField::KeyVersion),
+        _ => Err(corruption("invalid index field")),
+    }
+}
+
+fn record_from_tables<T>(
+    payloads: &T,
+    document_key: &[u8],
+    metadata_bytes: &[u8],
+) -> Result<DocumentRecord>
+where
+    T: ReadableTable<&'static [u8], &'static [u8]>,
+{
+    let metadata = decode_document_metadata(metadata_bytes)?;
+    let payload = if metadata.deleted {
+        None
+    } else {
+        let value = payloads
+            .get(document_key)
+            .map_err(storage)?
+            .ok_or_else(|| corruption("live document payload missing"))?;
+        Some(decode_document(value.value())?)
+    };
+    Ok(DocumentRecord { metadata, payload })
+}
+
+fn keys_with_prefix<T>(table: &T, prefix: &[u8]) -> Result<Vec<Vec<u8>>>
+where
+    T: ReadableTable<&'static [u8], &'static [u8]>,
+{
+    let end =
+        prefix_successor(prefix).ok_or_else(|| corruption("index prefix has no successor"))?;
+    let mut keys = Vec::new();
+    for item in table.range(prefix..end.as_slice()).map_err(storage)? {
+        let (key, _) = item.map_err(storage)?;
+        keys.push(key.value().to_vec());
+    }
+    Ok(keys)
 }
 fn operation_identity(operation: &WriteOperation) -> (&str, &str) {
     match operation {
@@ -992,6 +1768,16 @@ mod tests {
             value.mutation_hash = mutation_hash(&value);
             prop_assert_eq!(decode_mutation(&encode_mutation(&value)).expect("round trip"), value);
         }
+
+        #[test]
+        fn index_definition_canonical_round_trip(name in "[a-z]{1,20}", collection in "[a-z]{1,20}", tags in proptest::collection::vec(1_u8..=7, 1..=4)) {
+            let mut fields: Vec<_> = tags.into_iter().map(|tag| index_field_from_tag(tag).expect("valid generated field")).collect();
+            fields.sort();
+            fields.dedup();
+            prop_assume!(!fields.is_empty());
+            let value = IndexDefinition { name, collection, fields };
+            prop_assert_eq!(decode_index_definition(&encode_index_definition(&value)).expect("round trip"), value);
+        }
     }
 
     #[test]
@@ -1061,5 +1847,54 @@ mod tests {
         let report = engine.verify().expect("verification report");
         assert!(!report.valid);
         assert_eq!(report.error.as_deref(), Some("current payload mismatch"));
+    }
+
+    #[test]
+    fn verification_detects_altered_secondary_index() {
+        let directory = tempdir().expect("temporary directory");
+        let engine = RedbEngine::open(directory.path().join("tampered-index.vdb")).expect("open");
+        let identity = WriterIdentity::from_seed([1_u8; 16], 1, [2_u8; 32]).expect("identity");
+        let database_id = engine.metadata().expect("metadata").database_id;
+        let key = DatabaseKey::from_database_secret(&database_id, [3_u8; 32]).expect("key");
+        let document =
+            encrypt_document(&key, &database_id, "users", "alice", 1, b"{}").expect("encrypt");
+        engine
+            .write(
+                &[WriteOperation::Put {
+                    document,
+                    precondition: VersionPrecondition::MustNotExist,
+                }],
+                &identity,
+            )
+            .expect("write");
+        engine
+            .create_index(&IndexDefinition {
+                name: "versions".into(),
+                collection: "users".into(),
+                fields: vec![MetadataField::Version],
+            })
+            .expect("create index");
+
+        let tx = engine.db.begin_write().expect("tamper transaction");
+        {
+            let mut entries = tx.open_table(INDEX_ENTRIES).expect("index entries");
+            let key = entries
+                .first()
+                .expect("read first entry")
+                .expect("entry")
+                .0
+                .value()
+                .to_vec();
+            entries
+                .insert(key.as_slice(), b"wrong-document".as_slice())
+                .expect("tamper entry");
+        }
+        tx.commit().expect("commit tamper");
+        let report = engine.verify().expect("verification report");
+        assert!(!report.valid);
+        assert_eq!(
+            report.error.as_deref(),
+            Some("secondary index state mismatch")
+        );
     }
 }

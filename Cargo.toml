@@ -9,6 +9,7 @@ license = "Apache-2.0 OR MIT"
 anyhow = "1"
 argon2 = "0.5"
 axum = "0.8.9"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 base64 = "0.22"
 blake3 = "1.8.7"
 chacha20poly1305 = "0.11.0"
@@ -23,11 +24,20 @@ serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 zeroize = "1"
 
 [dev-dependencies]
 criterion = "0.8"
+bytes = "1"
+futures-util = "0.3"
+http-body = "1"
+http-body-util = "0.1"
 proptest = "1"
+rcgen = "0.14"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 tempfile = "3"
 
 [[bench]]

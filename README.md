@@ -2,7 +2,7 @@
 
 An early prototype of a lightweight, cryptographically verifiable, local-first encrypted document database.
 
-VDB is not production-ready. The current server has no TLS, authentication, or authorization and must not be exposed to an untrusted network. See [the current architecture](docs/architecture.md), [threat model](docs/threat-model.md), [invariants](docs/invariants.md), and [roadmap](docs/roadmap.md).
+VDB is not yet production-ready as a complete distributed database. Its built-in service is TLS-only and requires signed, authorized requests, but certificate automation, durable replay state, dynamic revocation, replication, and operational hardening remain. See [the current architecture](docs/architecture.md), [network protocol](docs/protocol.md), [threat model](docs/threat-model.md), [invariants](docs/invariants.md), and [roadmap](docs/roadmap.md).
 
 ## v0.1 invariants
 
@@ -13,7 +13,7 @@ VDB is not production-ready. The current server has no TLS, authentication, or a
 5. Every mutation has a database-bound BLAKE3 ID, Ed25519 signature, and hash-chain link.
 6. Document versions must increase monotonically.
 7. Local storage is ACID via redb.
-8. The database can run as a local CLI or expose a built-in HTTP API.
+8. The database can run as a local CLI or expose a versioned, authenticated HTTPS API.
 
 This is **not** yet production-ready cryptographic software. The current release establishes the architecture and invariants.
 
@@ -53,22 +53,71 @@ JSON
 ./target/release/vdb verify --db demo.vdb
 ```
 
-## Start the built-in API
+## Backup and operations
 
 ```bash
-./target/release/vdb serve --db demo.vdb --bind 127.0.0.1:8787
+./target/release/vdb backup --db demo.vdb --output demo.vdbbak
+./target/release/vdb backup-verify --backup demo.vdbbak
+./target/release/vdb restore --backup demo.vdbbak --db restored.vdb
+./target/release/vdb restore-verify --db restored.vdb
+./target/release/vdb inspect --db demo.vdb
+./target/release/vdb status --db demo.vdb
+# Stop all processes using the database before compaction.
+./target/release/vdb compact --db demo.vdb
+```
+
+See [backup and recovery](docs/backup-recovery.md) and the [operations runbook](docs/operations.md).
+
+## Start the built-in API
+
+Generate an Ed25519 service/device identity with `vdb writer-keygen`, retain its
+secret seed on the client, and place only the public identity in an authorization
+file:
+
+```json
+{
+  "principals": [
+    {
+      "principal_id": "<writer_id>",
+      "key_version": 1,
+      "public_key": "<public_key>",
+      "permissions": ["read", "write", "query", "verify", "admin"]
+    }
+  ]
+}
+```
+
+```bash
+./target/release/vdb serve \
+  --db demo.vdb \
+  --bind 127.0.0.1:8787 \
+  --tls-cert server-cert.pem \
+  --tls-key server-key.pem \
+  --auth-config authorization.json
 ```
 
 Endpoints:
 
 ```text
-GET  /health
-PUT  /v1/{collection}/{id}
-GET  /v1/{collection}/{id}
-GET  /v1/verify
+GET     /healthz
+GET     /readyz
+GET     /v1/documents/{collection}/{id}
+PUT     /v1/documents/{collection}/{id}
+DELETE  /v1/documents/{collection}/{id}
+POST    /v1/query
+POST    /v1/explain
+GET     /v1/verify
+GET     /v1/metrics
+GET     /v1/indexes/{collection}
+POST    /v1/indexes/{collection}
+DELETE  /v1/indexes/{collection}/{name}
+PUT     /v1/indexes/{collection}/{name}
 ```
 
-The PUT endpoint expects an already encrypted `EncryptedDocument` envelope. This is deliberate: remote storage should not need the plaintext encryption key.
+Except for health and readiness, requests require the protocol-version and
+Ed25519 authentication headers defined in [the protocol document](docs/protocol.md).
+PUT expects an already encrypted `EncryptedDocument` envelope. The service
+validates and stores ciphertext without receiving the plaintext encryption key.
 
 ## Architecture
 
@@ -84,7 +133,7 @@ XChaCha20-Poly1305 encryption
 +-----------------------------+
 | vdb process                 |
 |                             |
-| HTTP / local API            |
+| HTTPS / local API           |
 |       |                     |
 | validation                  |
 |       |                     |
@@ -109,15 +158,19 @@ Disk
 - stable MVCC read snapshots
 - canonical binary records and current-state/history verification
 - cryptographic writer identities, signed mutations, replay detection, Merkle checkpoints, and inclusion proofs
+- typed visible-metadata queries, collection scans, cursor pagination, explain plans, and durable secondary/compound indexes
+- TLS-only versioned REST, typed internal protocol requests, signed device/service authentication, scoped authorization, replay/rate controls, bounded requests, and graceful shutdown
+- signed dotted-version-vector replication, incremental missing-event exchange, explicit deterministic conflicts, tombstone synchronization, and event-set checkpoints
+- consistent verified backup/restore, operational snapshots, offline verified compaction, database inspection/status, JSON tracing, and authenticated metrics
 
 ## Next milestones
 
-- offline backup/restore and atomic database migrations
+- atomic database migrations and compatibility fixtures
 - stable API and compatibility fixtures
-- query planning with client-side filtering for protected fields
-- peer replication protocol
-- conflict resolution for offline/local-first replicas
+- trusted-client JSON filtering and planner statistics for protected-field candidate queries
+- dynamic principal revocation/configuration and durable or distributed replay/rate state
+- certificate issuance, rotation, and deployment automation
+- replication network transport, durable replica membership/revocation, retirement, and safe tombstone garbage collection
 - streaming change feed
-- TLS and capability-based authorization
-- snapshot / backup format
-- benchmarks and fuzz/property tests
+- streaming, incremental, compressed, and optionally encrypted backups
+- sustained fuzz campaigns, compatibility fixtures, and broader fault injection

@@ -2,6 +2,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use tempfile::tempdir;
 use vdb::{
     crypto::{DatabaseKey, decrypt_document, encrypt_document},
+    query::{IndexDefinition, MetadataField, Predicate, Query, QueryValue},
     store::Store,
 };
 
@@ -30,6 +31,46 @@ fn database_benchmarks(c: &mut Criterion) {
     });
     c.bench_function("verify_one_mutation_history", |b| {
         b.iter(|| store.verify().expect("verify history"))
+    });
+
+    for number in 0_u64..1_000 {
+        let id = format!("document-{number:04}");
+        let document = encrypt_document(
+            &key,
+            &database_id,
+            "query_bench",
+            &id,
+            number + 1,
+            br#"{"protected":true}"#,
+        )
+        .expect("encrypt query benchmark document");
+        store.put(&document).expect("seed query benchmark document");
+    }
+    let mut scan = Query::collection("query_bench");
+    scan.limit = 1_000;
+    scan.predicate = Some(Predicate::Ge {
+        field: MetadataField::Version,
+        value: QueryValue::Number(500),
+    });
+    c.bench_function("query_collection_scan_1000", |b| {
+        b.iter(|| store.query(&scan).expect("scan query"))
+    });
+
+    store
+        .create_index(&IndexDefinition {
+            name: "key_version".into(),
+            collection: "query_bench".into(),
+            fields: vec![MetadataField::KeyVersion],
+        })
+        .expect("create benchmark index");
+    let mut indexed = Query::collection("query_bench");
+    indexed.limit = 1_000;
+    indexed.predicate = Some(Predicate::Eq {
+        field: MetadataField::KeyVersion,
+        value: QueryValue::Number(1),
+    });
+    c.bench_function("query_secondary_index_1000", |b| {
+        b.iter(|| store.query(&indexed).expect("indexed query"))
     });
 }
 

@@ -58,6 +58,36 @@ impl WriterIdentity {
     pub(crate) fn sign(&self, message: &[u8]) -> String {
         hex::encode(self.signing_key.sign(message).to_bytes())
     }
+
+    /// Signs an application-defined, domain-separated message.
+    pub fn sign_bytes(&self, message: &[u8]) -> String {
+        self.sign(message)
+    }
+}
+
+pub fn verify_detached(public_key_hex: &str, signature_hex: &str, message: &[u8]) -> bool {
+    if public_key_hex.len() != 64 || signature_hex.len() != 128 {
+        return false;
+    }
+    let Ok(public) = hex::decode(public_key_hex).and_then(|bytes| {
+        bytes
+            .try_into()
+            .map_err(|_| hex::FromHexError::InvalidStringLength)
+    }) else {
+        return false;
+    };
+    let Ok(signature) = hex::decode(signature_hex).and_then(|bytes| {
+        bytes
+            .try_into()
+            .map_err(|_| hex::FromHexError::InvalidStringLength)
+    }) else {
+        return false;
+    };
+    let Ok(key) = VerifyingKey::from_bytes(&public) else {
+        return false;
+    };
+    key.verify(message, &Signature::from_bytes(&signature))
+        .is_ok()
 }
 
 pub(crate) fn verify_signature(
@@ -65,6 +95,9 @@ pub(crate) fn verify_signature(
     signature_hex: &str,
     message: &[u8],
 ) -> Result<()> {
+    if public_key_hex.len() != 64 || signature_hex.len() != 128 {
+        return Err(corruption("invalid Ed25519 key or signature length"));
+    }
     let public: [u8; 32] = hex::decode(public_key_hex)
         .map_err(corruption)?
         .try_into()

@@ -16,7 +16,7 @@ Items marked **enforced** are implemented and tested. Remaining items constrain 
 12. A document logical version always strictly increases across live and tombstone states. **Enforced.**
 13. Mutation sequences begin at one, are unique, contiguous, and ordered exactly as operations commit. **Enforced and verified.**
 14. Every mutation after genesis names the exact preceding mutation hash. **Enforced and verified.**
-15. Anything entering a VDB cryptographic hash or signature uses raw content bytes or an explicit domain-separated canonical binary encoding, never map iteration, platform-native integers, JSON formatting, or ambiguous delimiters. **Enforced for format 3.**
+15. Anything entering a VDB cryptographic hash or signature uses raw content bytes or an explicit domain-separated canonical binary encoding, never map iteration, platform-native integers, JSON formatting, or ambiguous delimiters. **Enforced for format 5.**
 16. Persisted canonical records reject wrong domains, truncation, overflow, excessive fields, invalid flags, checksum mismatch, and trailing bytes. **Enforced.**
 17. A held read snapshot never observes commits made after the snapshot began. **Enforced by redb MVCC and tested.**
 18. Concurrent readers do not block one another; concurrent exact-version writers have at most one successful commit. **Enforced and tested.**
@@ -26,7 +26,7 @@ Items marked **enforced** are implemented and tested. Remaining items constrain 
 22. Storage and network layers never require a document encryption key. **Enforced by the current API boundary.**
 23. No committed mutation may disappear without detectable evidence anchored outside the database. **Not yet enforced; external checkpoints are absent.**
 24. Tombstones remain until every relevant replica has observed them or a specified safe-GC rule applies. **Physical tombstones are enforced; replica-aware GC is not implemented.**
-25. Backup/restore preserves database identity, format, history, tombstones, and verification state. **Not implemented.**
+25. Backup/restore preserves database identity, format, history, tombstones, indexes, replication events, and verification state. **Enforced and recovery-tested.**
 26. A migration is atomic or restartable, version-gated, and tested forward and under interruption. **Not implemented.**
 27. Every mutation ID commits to database, operation, state, predecessor, writer ID, key version, and public key. **Enforced.**
 28. Every committed mutation has a valid Ed25519 signature and registered writer/key-version binding. **Enforced and verified.**
@@ -39,3 +39,35 @@ Items marked **enforced** are implemented and tested. Remaining items constrain 
 35. Decryption selects an exact key ID and version; rotation never silently substitutes the newest key. **Enforced and tested.**
 36. Password-wrapped key imports accept only the implemented Argon2id policy and authenticated wrap format; parameter downgrade is rejected. **Enforced.**
 37. Storage may validate envelope structure without keys but must not claim ciphertext authenticity until a key-holding client verifies the AEAD tag. **Enforced by the API boundary and documented limitation.**
+38. Server predicates and indexes operate only on explicitly visible metadata; protected payload bytes are never parsed by storage/query code. **Enforced by the typed field model.**
+39. Every index entry is derived from the same snapshot state as its document, and document writes update old/new entries atomically. **Enforced and verified.**
+40. Indexed and collection-scan execution apply the same residual AST and return identical logical results. **Enforced and differentially tested.**
+41. Compound indexes use only a contiguous leftmost equality prefix; unsupported plans fall back to scans rather than changing semantics. **Enforced.**
+42. Query ordering has document ID as a deterministic tie-breaker, and cursors resume strictly after that tuple. **Enforced and tested.**
+43. A protected predicate is never reported as server-evaluated; results explicitly require trusted-client filtering. **Enforced.**
+44. Blind/search-token queries fail closed until a leakage-reviewed token format exists. **Enforced.**
+45. Index catalog/entry corruption is detected locally, but catalog removal is not committed to signed history or Merkle state. **Explicit limitation.**
+46. Production serving has no plaintext-HTTP or unauthenticated protected-route fallback. **Enforced by the TLS-only entrypoint and middleware.**
+47. Every protected network request binds protocol version, method, exact target, request ID, timestamp, nonce, and body hash to an allowlisted Ed25519 identity. **Enforced and negatively tested.**
+48. Authorization is deny-by-default and independently scopes read, write, query, verification, and administration. **Enforced and tested.**
+49. Accepted request nonces cannot repeat within the configured in-process authentication window. **Enforced; restart/distributed replay is an explicit limitation.**
+50. Request bodies, execution time, concurrent work, and per-principal rate are bounded. A response timeout cannot release its database-work permit while detached blocking work is still running. **Enforced by middleware/service admission and tested for body/deadline limits.**
+51. API errors never expose raw storage-engine concepts or internal corruption details. **Enforced by structured error mapping.**
+52. Network storage paths accept opaque encrypted documents without content keys. **Enforced by the protocol types and socket tests.**
+53. Cancellation does not roll back an atomic write that has already entered blocking storage execution. **Explicit protocol semantic.**
+54. A replication event is uniquely identified by a database-bound signed causal dot and canonical content hash. **Enforced.**
+55. One replica counter cannot name two different events; exact duplicate delivery is idempotent. **Enforced atomically by the event/dot indexes and tested.**
+56. Synchronization state never acknowledges a missing counter as contiguous; reordered higher counters are represented as sparse dots. **Enforced and tested.**
+57. A causally incomplete event is retained but cannot suppress or become visible document state until its declared dependencies arrive. **Enforced and tested.**
+58. Concurrent document heads are preserved and deterministically ordered; put/put and delete/put conflicts are never silently resolved by arrival time. **Enforced and tested.**
+59. Conflict resolution is a new signed event causally observing all locally known heads. An unseen concurrent head may reintroduce conflict. **Enforced and tested.**
+60. Replication checkpoints commit to the complete sorted event-ID set and equal event sets produce equal roots independent of delivery order. **Enforced and tested.**
+61. Replication peer admission binds a fresh caller challenge, database ID, state root, replica/key identity, and Ed25519 signature. **Enforced by the embedded handshake API and negatively tested.**
+62. Replicated tombstones are retained until a future replica-membership-aware safe-GC rule is implemented. **Enforced by absence of physical event deletion.**
+63. No field-level CRDT merge occurs without a separately specified associative, commutative, and idempotent algebra. **No CRDT is currently implemented.**
+64. A backup is one MVCC snapshot and cannot contain a partial committed transaction. **Enforced by one redb read transaction and concurrent-write tested.**
+65. Completed backup and restore destinations are atomically promoted only after durable write and full verification; existing or concurrently created destinations are never overwritten. **Enforced with no-clobber promotion and interruption/corruption/race regression tests.**
+66. Compaction never runs through an active `Store`, never discards logical history/tombstones, and requires valid state before and after. **Enforced by the offline command.**
+67. Operational diagnostics and telemetry never expose protected plaintext, keys, ciphertext, signatures, nonces, authentication headers, or request bodies. **Enforced by typed reports and explicit log fields.**
+68. Hostile length fields and text encodings are rejected before attacker-selected large reservations or Base64 allocations. **Enforced for canonical records, backups, query cursors, envelopes, and key wrappers; property/fuzz tested.**
+69. Metadata queries fail rather than partially execute when their scan-row or aggregate materialization budget is exceeded. **Enforced at storage iteration boundaries.**
