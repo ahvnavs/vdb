@@ -3,3 +3,4 @@
 /fuzz/artifacts/
 /fuzz/corpus/
 *.vdb
+*.key

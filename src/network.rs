@@ -33,6 +33,7 @@ pub const HEADER_TIMESTAMP: &str = "x-vdb-timestamp";
 pub const HEADER_NONCE: &str = "x-vdb-nonce";
 pub const HEADER_SIGNATURE: &str = "x-vdb-signature";
 pub const HEADER_REQUEST_ID: &str = "x-vdb-request-id";
+pub const AUTHORIZATION_CONFIG_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,6 +46,7 @@ pub enum Permission {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorizedPrincipal {
     pub principal_id: String,
     pub key_version: u32,
@@ -53,7 +55,9 @@ pub struct AuthorizedPrincipal {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorizationConfig {
+    pub format_version: u16,
     pub principals: Vec<AuthorizedPrincipal>,
 }
 
@@ -258,6 +262,13 @@ where
 }
 
 fn validate_server_config(config: &TlsServerConfig) -> anyhow::Result<()> {
+    if config.authorization.format_version != AUTHORIZATION_CONFIG_VERSION {
+        anyhow::bail!(
+            "unsupported authorization config version {}; supported version is {}",
+            config.authorization.format_version,
+            AUTHORIZATION_CONFIG_VERSION
+        );
+    }
     if config.authorization.principals.is_empty() {
         anyhow::bail!("at least one authorized principal is required");
     }
@@ -695,6 +706,7 @@ mod tests {
             .into_iter()
             .collect();
             let authorization = AuthorizationConfig {
+                format_version: AUTHORIZATION_CONFIG_VERSION,
                 principals: vec![
                     AuthorizedPrincipal {
                         principal_id: identity.writer_id(),

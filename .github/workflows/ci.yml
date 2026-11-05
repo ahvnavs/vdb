@@ -20,7 +20,21 @@ jobs:
       - run: cargo check --all-targets --all-features
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
+      - run: cargo test --test release_acceptance
       - run: cargo check --manifest-path fuzz/Cargo.toml --bins
+
+  platform-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets --all-features
+      - run: cargo test --locked --all-features
 
   dependency-audit:
     runs-on: ubuntu-latest

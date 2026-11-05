@@ -36,8 +36,9 @@ In particular:
   membership/revocation service;
 - local verification cannot detect a self-consistent rollback without an
   externally retained checkpoint; and
-- raw keys in command-line arguments and CLI plaintext output remain exposed
-  to operating-system and terminal capture.
+- raw CLI key files remain exposed to endpoint compromise, administrator
+  access, backup, and permission mistakes; OS keychain/HSM integration is not
+  implemented.
 
 Confidentiality, integrity, authentication, authorization, canonical parsing,
 cryptographic misuse, crash consistency, corruption, rollback, unsafe resource

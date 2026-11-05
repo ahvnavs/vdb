@@ -8,7 +8,7 @@ Restore compilation; authenticate envelope metadata; validate inputs; use unambi
 
 ## Stage 1 — stable embedded kernel (in progress)
 
-Implemented foundation: typed errors, internal storage traits, database identity and format header, separate document metadata, tombstones, optimistic concurrency, atomic multi-document transactions, MVCC read snapshots, canonical records, current-state verification, client-side authenticated encryption, a versioned key hierarchy, password-protected key export, consistent verified logical backup/restore, operational snapshots, inspection/status, and offline verified compaction. Remaining: migrations; savepoints where justified; incremental/streaming backup; point-in-time recovery; broader crash/fault injection and compatibility testing; stable API review and benchmark baseline.
+Implemented foundation: typed errors, internal storage traits, database identity and format header, separate document metadata, tombstones, optimistic concurrency, atomic multi-document transactions, MVCC read snapshots, canonical records, current-state verification, client-side authenticated encryption, a versioned key hierarchy, password-protected key export, consistent verified logical backup/restore, operational snapshots, inspection/status, offline verified compaction, and a reproducible performance baseline. Remaining: migrations; savepoints where justified; incremental/streaming backup; point-in-time recovery; broader crash/fault injection and compatibility testing; stable API review; and profiler-guided reduction of measured file/memory amplification.
 
 ## Stage 2 — identity and verifiable history (foundation implemented)
 
@@ -16,7 +16,7 @@ Implemented Ed25519 writer identities, key-version metadata, canonical signed mu
 
 ## Stage 3 — query and indexing (metadata foundation implemented)
 
-Implemented typed metadata predicates, bounded collection scans, projection, ordering, cursor pagination, durable secondary/compound indexes, atomic maintenance/rebuild, planner/explain, client-filter signaling, differential/property tests, fuzz targets, and scan/index benchmark harnesses. Remaining: trusted-client JSON evaluation API, planner statistics/costing, index-assisted ordering/ranges, authenticated snapshot-aware cursors, sustained fuzz campaigns, and measured baselines. Searchable tokens remain rejected pending a dedicated leakage ADR.
+Implemented typed metadata predicates, bounded collection scans, projection, ordering, cursor pagination, durable secondary/compound indexes, atomic maintenance/rebuild, planner/explain, client-filter signaling, differential/property tests, fuzz targets, scan/index benchmarks, and a dated measured baseline. Remaining: trusted-client JSON evaluation API, planner statistics/costing, index-assisted ordering/ranges, authenticated snapshot-aware cursors, sustained fuzz campaigns, and selective-index workload baselines. Searchable tokens remain rejected pending a dedicated leakage ADR.
 
 ## Stage 4 — secured network service (foundation implemented)
 

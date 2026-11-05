@@ -4,7 +4,7 @@ Status: implemented REST adapter and native service abstraction, protocol versio
 
 ## Layering
 
-`DatabaseService` accepts typed `ProtocolRequest` values and returns typed `ProtocolResponse` values. It is independent of HTTP and redb. The REST router translates `/v1` requests into that service boundary; no table names, redb transactions, page concepts, or storage-engine errors cross the API.
+`DatabaseService` accepts typed `ProtocolRequest` values and returns typed `ProtocolResponse` values. It is independent of HTTP and redb. The REST router translates `/v1` requests into that service boundary; no table names, redb transactions, page concepts, or storage-engine errors cross the API. The authorization JSON has required `format_version: 1`, rejects unknown fields, and is the current stable configuration schema; incompatible configuration changes require a new format version.
 
 The server is TLS-only. `vdb serve` requires a PEM certificate, PEM private key, and authorization JSON. Rustls provides TLS through `axum-server`. Plain HTTP is not offered and there is no insecure fallback.
 

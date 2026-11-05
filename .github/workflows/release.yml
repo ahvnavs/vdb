@@ -1,0 +1,92 @@
+name: Release artifacts
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo test --locked --release --all-features
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Install SBOM generator
+        run: cargo install cargo-cyclonedx --locked
+      - name: Generate SBOM
+        run: cargo cyclonedx --format json --override-filename vdb-${{ matrix.target }}.cdx
+      - name: Stage Unix archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="vdb-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$stage"
+          cp "target/${{ matrix.target }}/release/vdb" "$stage/"
+          cp README.md CHANGELOG.md SECURITY.md LICENSE-APACHE LICENSE-MIT "$stage/"
+          cp "vdb-${{ matrix.target }}.cdx.json" "$stage/"
+          tar -czf "$stage.tar.gz" "$stage"
+      - name: Stage Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $stage = "vdb-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $stage
+          Copy-Item "target/${{ matrix.target }}/release/vdb.exe" $stage
+          Copy-Item README.md,CHANGELOG.md,SECURITY.md,LICENSE-APACHE,LICENSE-MIT $stage
+          Copy-Item "vdb-${{ matrix.target }}.cdx.json" $stage
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vdb-${{ matrix.target }}
+          path: |
+            vdb-*.tar.gz
+            vdb-*.zip
+          if-no-files-found: error
+
+  checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vdb-*
+          merge-multiple: true
+          path: dist
+      - name: Create checksums
+        run: cd dist && sha256sum vdb-*.tar.gz vdb-*.zip > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vdb-release
+          path: dist/
+

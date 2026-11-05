@@ -38,8 +38,17 @@ http-body-util = "0.1"
 proptest = "1"
 rcgen = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"
 
 [[bench]]
 name = "database"
+harness = false
+
+[[bench]]
+name = "comparison"
+harness = false
+
+[[bench]]
+name = "resource_probe"
 harness = false

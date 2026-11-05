@@ -2,7 +2,7 @@
 
 An early prototype of a lightweight, cryptographically verifiable, local-first encrypted document database.
 
-VDB is not yet production-ready as a complete distributed database. Its built-in service is TLS-only and requires signed, authorized requests, but certificate automation, durable replay state, dynamic revocation, replication, and operational hardening remain. See [the current architecture](docs/architecture.md), [network protocol](docs/protocol.md), [threat model](docs/threat-model.md), [invariants](docs/invariants.md), and [roadmap](docs/roadmap.md).
+VDB is not yet a supported 1.0 distributed database. Its built-in service is TLS-only and requires signed, authorized requests, but network replication transport, durable key custody, migrations, certificate automation, durable replay state, dynamic revocation, and release provenance remain. Start with the [installation guide](docs/installation.md), [quickstart](docs/quickstart.md), [CLI reference](docs/cli.md), and [compatibility policy](docs/compatibility.md). See also the [current architecture](docs/architecture.md), [network protocol](docs/protocol.md), [threat model](docs/threat-model.md), [invariants](docs/invariants.md), and [roadmap](docs/roadmap.md).
 
 ## v0.1 invariants
 
@@ -26,7 +26,7 @@ cargo build --release
 ## Generate a database key
 
 ```bash
-KEY=$(./target/release/vdb keygen)
+./target/release/vdb keygen --output app.key
 ```
 
 Keep this key on the client. The networked database process does not need it.
@@ -38,13 +38,13 @@ cat > alice.json <<'JSON'
 {"name":"Alice","role":"engineer"}
 JSON
 
-./target/release/vdb put --db demo.vdb --key "$KEY" users alice alice.json
+./target/release/vdb put --db demo.vdb --key-file app.key users alice alice.json
 ```
 
 ## Read and decrypt
 
 ```bash
-./target/release/vdb get --db demo.vdb --key "$KEY" users alice
+./target/release/vdb get --db demo.vdb --key-file app.key users alice
 ```
 
 ## Verify mutation history
@@ -66,16 +66,18 @@ JSON
 ./target/release/vdb compact --db demo.vdb
 ```
 
-See [backup and recovery](docs/backup-recovery.md) and the [operations runbook](docs/operations.md).
+See [backup and recovery](docs/backup-recovery.md), the [operations runbook](docs/operations.md),
+and the [reproducible benchmark methodology](docs/benchmarks.md).
 
 ## Start the built-in API
 
-Generate an Ed25519 service/device identity with `vdb writer-keygen`, retain its
+Generate an Ed25519 service/device identity with `vdb writer-keygen --output device.json`, retain its
 secret seed on the client, and place only the public identity in an authorization
 file:
 
 ```json
 {
+  "format_version": 1,
   "principals": [
     {
       "principal_id": "<writer_id>",

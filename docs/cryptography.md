@@ -16,7 +16,7 @@ The storage and HTTP layers treat the envelope as opaque. They can validate its 
 
 Rotation preserves the key ID, generates a new independent root secret, and increments the version. Envelopes select an exact `(key ID, version)`; no fallback to a newer key occurs. A `Keyring` may retain old versions for old envelopes while new writes use the newest version. Rotation does not re-encrypt existing records automatically, and deletion of an old key makes its records unavailable.
 
-The current CLI accepts a raw high-entropy 32-byte hexadecimal database secret for compatibility and derives a database-scoped key ID. Arguments and `keygen` output may be exposed by shell history, process inspection, or terminal capture, so these commands are transitional provisioning interfaces rather than safe fleet key custody.
+The current CLI reads a raw high-entropy 32-byte hexadecimal database secret from a key file and derives a database-scoped key ID. `keygen` creates a new file without overwrite and uses mode 0600 on Unix. The file remains a raw secret and is not a substitute for OS keychain, hardware-backed, or external key-manager custody.
 
 ## Password-protected key export
 

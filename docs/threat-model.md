@@ -54,7 +54,7 @@ Logical backups contain ciphertext plus all visible metadata, signed history, in
 
 The current non-streaming backup reader rejects archives larger than 512 MiB before allocation. Backup and restore promotion use an atomic no-clobber link in the destination directory, so a destination created during verification is preserved and the operation fails. Cross-filesystem promotion is not used.
 
-Raw key CLI arguments and `keygen` stdout can leak through process listings, shell history, logs around the process, or terminal capture. The wrapped-key library format is the supported safe-at-rest export mechanism, but CLI file/descriptor integration and an external key manager are not yet implemented.
+CLI key files contain raw keys. Creation is no-clobber and mode 0600 on Unix, but file backup, endpoint compromise, administrator access, and incorrectly copied permissions can expose them. The wrapped-key library format is the supported safe-at-rest export mechanism, but CLI password wrapping and external key-manager integration are not yet implemented.
 
 ## Rollback, availability, and non-goals
 

@@ -1,7 +1,14 @@
-use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
+use serde::Serialize;
 use vdb::{
     crypto::{DatabaseKey, decrypt_document, encrypt_document, generate_key, key_from_hex},
     identity::WriterIdentity,
@@ -24,13 +31,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Keygen,
-    WriterKeygen,
+    Keygen {
+        #[arg(long)]
+        output: PathBuf,
+    },
+    WriterKeygen {
+        #[arg(long)]
+        output: PathBuf,
+    },
     Put {
         #[arg(long)]
         db: String,
         #[arg(long)]
-        key: String,
+        key_file: PathBuf,
         collection: String,
         id: String,
         file: String,
@@ -41,7 +54,7 @@ enum Command {
         #[arg(long)]
         db: String,
         #[arg(long)]
-        key: String,
+        key_file: PathBuf,
         collection: String,
         id: String,
     },
@@ -101,36 +114,53 @@ enum Command {
     },
 }
 
+#[derive(Serialize)]
+struct WriterIdentityFile<'a> {
+    format_version: u16,
+    writer_id: &'a str,
+    key_version: u32,
+    algorithm: &'static str,
+    public_key: &'a str,
+    secret_seed: &'a str,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     match cli.command {
-        Command::Keygen => {
+        Command::Keygen { output } => {
             let key = zeroize::Zeroizing::new(generate_key()?);
             let encoded = zeroize::Zeroizing::new(hex::encode(*key));
-            println!("{}", encoded.as_str());
+            write_secret_file(&output, format!("{}\n", encoded.as_str()).as_bytes())?;
+            println!("created database key file {}", output.display());
         }
-        Command::WriterKeygen => {
+        Command::WriterKeygen { output } => {
             let identity = WriterIdentity::generate()?;
             let secret = identity.secret_seed_hex();
-            println!(
-                "writer_id={}\nkey_version={}\nalgorithm=Ed25519\npublic_key={}\nsecret_seed={}",
-                identity.writer_id(),
-                identity.key_version(),
-                identity.public_key(),
-                secret.as_str()
-            );
+            let writer_id = identity.writer_id();
+            let public_key = identity.public_key();
+            let encoded =
+                zeroize::Zeroizing::new(serde_json::to_vec_pretty(&WriterIdentityFile {
+                    format_version: 1,
+                    writer_id: &writer_id,
+                    key_version: identity.key_version(),
+                    algorithm: "Ed25519",
+                    public_key: &public_key,
+                    secret_seed: secret.as_str(),
+                })?);
+            write_secret_file(&output, encoded.as_ref())?;
+            println!("created writer identity file {}", output.display());
         }
         Command::Put {
             db,
-            key,
+            key_file,
             collection,
             id,
             file,
             version,
         } => {
-            let raw_key = zeroize::Zeroizing::new(key_from_hex(&key)?);
+            let raw_key = read_database_key(&key_file)?;
             let plaintext = zeroize::Zeroizing::new(fs::read(file)?);
             serde_json::from_slice::<serde_json::Value>(plaintext.as_ref())
                 .map_err(|e| anyhow!("input must be valid JSON: {e}"))?;
@@ -150,13 +180,14 @@ async fn main() -> Result<()> {
         }
         Command::Get {
             db,
-            key,
+            key_file,
             collection,
             id,
         } => {
             let store = Store::open(&db)?;
             let database_id = store.metadata()?.database_id;
-            let key = DatabaseKey::from_database_secret(&database_id, key_from_hex(&key)?)?;
+            let raw_key = read_database_key(&key_file)?;
+            let key = DatabaseKey::from_database_secret(&database_id, *raw_key)?;
             let doc = store
                 .get(&collection, &id)?
                 .ok_or_else(|| anyhow!("not found"))?;
@@ -224,6 +255,26 @@ async fn main() -> Result<()> {
             .await?;
         }
     }
+    Ok(())
+}
+
+fn read_database_key(path: &Path) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+    let encoded = zeroize::Zeroizing::new(fs::read_to_string(path)?);
+    Ok(zeroize::Zeroizing::new(key_from_hex(encoded.trim())?))
+}
+
+fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
     Ok(())
 }
 
